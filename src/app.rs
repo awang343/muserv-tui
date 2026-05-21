@@ -1,4 +1,4 @@
-use crate::api::{self, Client, Playlist, PlaylistTrack, Track, TrackTag};
+use crate::api::{self, Client, Library, Playlist, PlaylistTrack, Track, TrackTag};
 use crate::mpv::Mpv;
 use crate::settings::Settings;
 use anyhow::Result;
@@ -23,6 +23,9 @@ enum Mode {
         index: usize,
         track_id: i64,
     },
+    PickLibrary {
+        index: usize,
+    },
     SortPicker {
         index: usize,
     },
@@ -32,14 +35,20 @@ enum Mode {
 enum SettingsField {
     ServerUrl,
     AuthToken,
+    Library,
 }
 
 impl SettingsField {
-    const ALL: [SettingsField; 2] = [SettingsField::ServerUrl, SettingsField::AuthToken];
+    const ALL: [SettingsField; 3] = [
+        SettingsField::ServerUrl,
+        SettingsField::AuthToken,
+        SettingsField::Library,
+    ];
     fn label(&self) -> &'static str {
         match self {
             SettingsField::ServerUrl => "Server URL",
             SettingsField::AuthToken => "Auth Token",
+            SettingsField::Library => "Library",
         }
     }
 }
@@ -180,6 +189,8 @@ pub struct App {
     playlist_tracks_state: ListState,
     playlist_tracks_for: Option<i64>,
     current_tags_for: Option<i64>,
+    libraries: Vec<Library>,
+    library_id: Option<i64>,
     repeat: RepeatMode,
     sort_key: SortKey,
     status_msg: String,
@@ -191,7 +202,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(client: Client, mpv: Mpv, tracks: Vec<Track>, settings: Settings) -> Self {
+    pub fn new(
+        client: Client,
+        mpv: Mpv,
+        tracks: Vec<Track>,
+        settings: Settings,
+        libraries: Vec<Library>,
+        library_id: Option<i64>,
+    ) -> Self {
         let filtered: Vec<usize> = (0..tracks.len()).collect();
         let mut list_state = ListState::default();
         if !filtered.is_empty() {
@@ -218,6 +236,8 @@ impl App {
             playlist_tracks: Vec::new(),
             playlist_tracks_state: ListState::default(),
             playlist_tracks_for: None,
+            libraries,
+            library_id,
             repeat: RepeatMode::Off,
             sort_key: SortKey::Default,
             status_msg: String::new(),
@@ -231,8 +251,89 @@ impl App {
         app
     }
 
+    fn library_id(&self) -> Option<i64> {
+        self.library_id
+    }
+
+    fn current_library_name(&self) -> Option<String> {
+        let id = self.library_id?;
+        self.libraries.iter().find(|l| l.id == id).map(|l| l.name.clone())
+    }
+
+    fn switch_library(&mut self, new_id: i64) {
+        if self.library_id == Some(new_id) {
+            return;
+        }
+        self.library_id = Some(new_id);
+        let name = self
+            .libraries
+            .iter()
+            .find(|l| l.id == new_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_default();
+        self.settings.selected_library = name.clone();
+        let _ = self.settings.save();
+        self.saved_settings = self.settings.clone();
+        match self.client.list_tracks(new_id) {
+            Ok(t) => {
+                self.tracks = t;
+                self.status_msg = format!("library: {name} ({} tracks)", self.tracks.len());
+            }
+            Err(e) => {
+                self.tracks.clear();
+                self.status_msg = format!("library {name}: {e}");
+            }
+        }
+        self.apply_filter("");
+        self.current_tags.clear();
+        self.current_tags_for = None;
+        self.playlist_tracks.clear();
+        self.playlist_tracks_for = None;
+        self.playlist_tracks_state.select(None);
+        self.playlists_state.select(None);
+        self.refresh_playlists();
+    }
+
+    fn refresh_libraries_list(&mut self) {
+        match self.client.list_libraries() {
+            Ok(libs) => {
+                let prev_id = self.library_id;
+                self.libraries = libs;
+                // Keep current selection if still present; otherwise pick first.
+                let new = prev_id
+                    .filter(|id| self.libraries.iter().any(|l| l.id == *id))
+                    .or_else(|| self.libraries.first().map(|l| l.id));
+                if let Some(id) = new {
+                    if prev_id != Some(id) {
+                        self.switch_library(id);
+                    } else {
+                        // Even on the same id, name may have changed; sync settings.
+                        if let Some(n) = self.current_library_name() {
+                            self.settings.selected_library = n;
+                        }
+                    }
+                } else {
+                    self.library_id = None;
+                    self.tracks.clear();
+                    self.apply_filter("");
+                }
+            }
+            Err(e) => {
+                self.status_msg = format!("libraries: {e}");
+            }
+        }
+    }
+
     fn refresh_playlists(&mut self) {
-        match self.client.list_playlists() {
+        let Some(lib) = self.library_id() else {
+            self.playlists.clear();
+            self.playlists_state.select(None);
+            self.playlist_tracks.clear();
+            self.playlist_tracks_state.select(None);
+            self.playlist_tracks_for = None;
+            return;
+        };
+        match self.client.list_playlists(lib) {
             Ok(pls) => {
                 let cur = self
                     .selected_playlist_id()
@@ -265,7 +366,10 @@ impl App {
             self.playlist_tracks_state.select(None);
             return;
         };
-        match self.client.get_playlist_tracks(id) {
+        let Some(lib) = self.library_id() else {
+            return;
+        };
+        match self.client.get_playlist_tracks(lib, id) {
             Ok(tracks) => {
                 self.playlist_tracks = tracks;
                 self.playlist_tracks_for = Some(id);
@@ -301,7 +405,11 @@ impl App {
     }
 
     fn trigger_rescan(&mut self) {
-        match self.client.trigger_scan() {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return;
+        };
+        match self.client.trigger_scan(lib) {
             Ok(state) => {
                 self.status_msg = if state.running {
                     "rescanning library…".into()
@@ -325,7 +433,11 @@ impl App {
             return;
         }
         self.last_scan_poll = Instant::now();
-        let state = match self.client.scan_status() {
+        let Some(lib) = self.library_id() else {
+            self.scan_polling = false;
+            return;
+        };
+        let state = match self.client.scan_status(lib) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -343,7 +455,7 @@ impl App {
                 s.seen, s.inserted, s.updated, s.unchanged, s.failed
             )
         });
-        match self.client.list_tracks() {
+        match self.client.list_tracks(lib) {
             Ok(t) => {
                 self.tracks = t;
                 let prev_id = self.selected_track().map(|t| t.id);
@@ -422,6 +534,7 @@ impl App {
                     match field {
                         SettingsField::ServerUrl => self.settings.server_url = buf,
                         SettingsField::AuthToken => self.settings.auth_token = buf,
+                        SettingsField::Library => {} // picked via overlay, not text input
                     }
                     self.mode = Mode::Normal;
                     return Ok(());
@@ -494,7 +607,11 @@ impl App {
                         if let Some(p) = self.playlists.get(index) {
                             let pid = p.id;
                             let pname = p.name.clone();
-                            match self.client.add_to_playlist(pid, track_id) {
+                            let Some(lib) = self.library_id() else {
+                                self.status_msg = "no library selected".into();
+                                return Ok(());
+                            };
+                            match self.client.add_to_playlist(lib, pid, track_id) {
                                 Ok(()) => {
                                     self.status_msg = format!("added to {pname}");
                                     if self.playlist_tracks_for == Some(pid) {
@@ -520,6 +637,36 @@ impl App {
                     _ => {}
                 }
                 self.mode = Mode::PickPlaylist { index, track_id };
+                return Ok(());
+            }
+            Mode::PickLibrary { mut index } => {
+                let len = self.libraries.len();
+                match key.code {
+                    KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        return Ok(());
+                    }
+                    KeyCode::Enter => {
+                        let chosen = self.libraries.get(index).map(|l| l.id);
+                        self.mode = Mode::Normal;
+                        if let Some(id) = chosen {
+                            self.switch_library(id);
+                        } else {
+                            self.status_msg = "no libraries available".into();
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if len > 0 {
+                            index = (index + 1).min(len - 1);
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        index = index.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                self.mode = Mode::PickLibrary { index };
                 return Ok(());
             }
             Mode::SortPicker { mut index } => {
@@ -611,6 +758,10 @@ impl App {
             }
             (KeyCode::Char('F'), _) => {
                 self.trigger_rescan();
+                return Ok(());
+            }
+            (KeyCode::Char('L'), _) => {
+                self.open_library_picker();
                 return Ok(());
             }
             _ => {}
@@ -750,7 +901,11 @@ impl App {
         self.playlist_tracks_state.select(Some(new_idx));
 
         let track_ids: Vec<i64> = self.playlist_tracks.iter().map(|p| p.track_id).collect();
-        if let Err(e) = self.client.set_playlist_tracks(pid, &track_ids) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        if let Err(e) = self.client.set_playlist_tracks(lib, pid, &track_ids) {
             self.status_msg = format!("reorder failed: {e}");
             self.refresh_playlist_tracks();
         }
@@ -776,7 +931,11 @@ impl App {
             self.status_msg = "playlist name is empty".into();
             return;
         }
-        match self.client.create_playlist(name) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return;
+        };
+        match self.client.create_playlist(lib, name) {
             Ok(p) => {
                 self.status_msg = format!("created playlist {}", p.name);
                 self.refresh_playlists();
@@ -795,7 +954,11 @@ impl App {
             self.status_msg = "name is empty".into();
             return;
         }
-        match self.client.rename_playlist(id, name) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return;
+        };
+        match self.client.rename_playlist(lib, id, name) {
             Ok(_) => {
                 self.status_msg = "renamed".into();
                 self.refresh_playlists();
@@ -809,7 +972,11 @@ impl App {
             return Ok(());
         };
         let name = self.selected_playlist_name().unwrap_or_default();
-        match self.client.delete_playlist(id) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        match self.client.delete_playlist(lib, id) {
             Ok(()) => {
                 self.status_msg = format!("deleted {name}");
                 self.playlists_state.select(None);
@@ -857,7 +1024,11 @@ impl App {
         let Some(pt) = self.playlist_tracks.get(idx).cloned() else {
             return Ok(());
         };
-        match self.client.remove_from_playlist(pid, pt.track_id) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        match self.client.remove_from_playlist(lib, pid, pt.track_id) {
             Ok(()) => {
                 self.status_msg = "removed from playlist".into();
                 self.refresh_playlist_tracks();
@@ -877,18 +1048,36 @@ impl App {
     fn handle_settings_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                self.settings_field = SettingsField::AuthToken;
+                let idx = SettingsField::ALL
+                    .iter()
+                    .position(|f| *f == self.settings_field)
+                    .unwrap_or(0);
+                let next = (idx + 1).min(SettingsField::ALL.len() - 1);
+                self.settings_field = SettingsField::ALL[next];
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.settings_field = SettingsField::ServerUrl;
+                let idx = SettingsField::ALL
+                    .iter()
+                    .position(|f| *f == self.settings_field)
+                    .unwrap_or(0);
+                let next = idx.saturating_sub(1);
+                self.settings_field = SettingsField::ALL[next];
             }
-            KeyCode::Enter | KeyCode::Char('e') => {
-                let buf = match self.settings_field {
-                    SettingsField::ServerUrl => self.settings.server_url.clone(),
-                    SettingsField::AuthToken => self.settings.auth_token.clone(),
-                };
-                self.mode = Mode::EditSetting(self.settings_field, buf);
-            }
+            KeyCode::Enter | KeyCode::Char('e') => match self.settings_field {
+                SettingsField::ServerUrl => {
+                    self.mode = Mode::EditSetting(
+                        self.settings_field,
+                        self.settings.server_url.clone(),
+                    );
+                }
+                SettingsField::AuthToken => {
+                    self.mode = Mode::EditSetting(
+                        self.settings_field,
+                        self.settings.auth_token.clone(),
+                    );
+                }
+                SettingsField::Library => self.open_library_picker(),
+            },
             KeyCode::Char('s') => self.save_and_apply_settings()?,
             KeyCode::Char('r') | KeyCode::Esc => {
                 self.settings = self.saved_settings.clone();
@@ -919,7 +1108,42 @@ impl App {
         }
         let _ = self.mpv.set_http_headers(&headers);
 
-        match self.client.list_tracks() {
+        // Re-fetch libraries against the (possibly new) server, then load tracks.
+        match self.client.list_libraries() {
+            Ok(libs) => {
+                self.libraries = libs;
+                let prev_name = self.settings.selected_library.clone();
+                let pick = self
+                    .libraries
+                    .iter()
+                    .find(|l| l.name == prev_name)
+                    .or_else(|| self.libraries.first())
+                    .cloned();
+                self.library_id = pick.as_ref().map(|l| l.id);
+                if let Some(ref l) = pick {
+                    self.settings.selected_library = l.name.clone();
+                    self.saved_settings.selected_library = l.name.clone();
+                }
+            }
+            Err(e) => {
+                self.libraries.clear();
+                self.library_id = None;
+                self.status_msg = format!("saved, but libraries fetch failed: {e}");
+                return Ok(());
+            }
+        }
+
+        let Some(lib) = self.library_id() else {
+            self.tracks.clear();
+            self.filtered.clear();
+            self.list_state.select(None);
+            self.current_tags.clear();
+            self.current_tags_for = None;
+            self.status_msg = "saved — server has no libraries".into();
+            return Ok(());
+        };
+
+        match self.client.list_tracks(lib) {
             Ok(t) => {
                 self.tracks = t;
                 self.filtered = (0..self.tracks.len()).collect();
@@ -931,6 +1155,7 @@ impl App {
                 });
                 self.current_tags.clear();
                 self.current_tags_for = None;
+                self.refresh_playlists();
                 self.status_msg = format!("saved & reloaded ({} tracks)", self.tracks.len());
             }
             Err(e) => {
@@ -999,6 +1224,20 @@ impl App {
         Ok(())
     }
 
+    fn open_library_picker(&mut self) {
+        // Always re-fetch first so the picker reflects current server state.
+        self.refresh_libraries_list();
+        if self.libraries.is_empty() {
+            self.status_msg = "no libraries on this server".into();
+            return;
+        }
+        let cur = self
+            .library_id
+            .and_then(|id| self.libraries.iter().position(|l| l.id == id))
+            .unwrap_or(0);
+        self.mode = Mode::PickLibrary { index: cur };
+    }
+
     fn open_tags_popup(&mut self) {
         if self.selected_track().is_none() {
             self.status_msg = "no track selected".into();
@@ -1014,7 +1253,11 @@ impl App {
             self.apply_filter("");
             return;
         }
-        match self.client.search(q) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return;
+        };
+        match self.client.search(lib, q) {
             Ok(hits) => {
                 let by_id: std::collections::HashMap<i64, usize> = self
                     .tracks
@@ -1141,7 +1384,11 @@ impl App {
         let Some(track_id) = self.selected_track().map(|t| t.id) else {
             return Ok(());
         };
-        match self.client.remove_user_tag(track_id, tag.tag_id) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        match self.client.remove_user_tag(lib, track_id, tag.tag_id) {
             Ok(()) => {
                 self.status_msg = format!("removed {}", tag.display());
                 self.current_tags_for = None;
@@ -1280,7 +1527,12 @@ impl App {
         if self.current_tags_for == Some(t) {
             return;
         }
-        match self.client.list_track_tags(t) {
+        let Some(lib) = self.library_id() else {
+            self.current_tags.clear();
+            self.current_tags_for = Some(t);
+            return;
+        };
+        match self.client.list_track_tags(lib, t) {
             Ok(tags) => {
                 self.current_tags = tags;
                 self.current_tags_for = Some(t);
@@ -1359,7 +1611,11 @@ impl App {
         let Some(track) = self.selected_track().map(|t| t.id) else {
             return Ok(());
         };
-        match self.client.add_user_tag(track, &ns, &val) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        match self.client.add_user_tag(lib, track, &ns, &val) {
             Ok(_) => {
                 self.status_msg = format!("added {}", fmt_tag(&ns, &val));
                 self.current_tags_for = None; // force refresh
@@ -1400,9 +1656,49 @@ impl App {
         if let Mode::PickPlaylist { .. } = &self.mode {
             self.render_pick_playlist_overlay(f);
         }
+        if let Mode::PickLibrary { .. } = &self.mode {
+            self.render_pick_library_overlay(f);
+        }
         if let Mode::SortPicker { .. } = &self.mode {
             self.render_sort_picker_overlay(f);
         }
+    }
+
+    fn render_pick_library_overlay(&self, f: &mut Frame) {
+        let Mode::PickLibrary { index } = self.mode else {
+            return;
+        };
+        let area = centered_rect(60, 60, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let items: Vec<ListItem> = self
+            .libraries
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let is_cursor = i == index;
+                let is_active = self.library_id == Some(l.id);
+                let prefix = if is_cursor { "> " } else { "  " };
+                let marker = if is_active { " *" } else { "" };
+                let style = if is_cursor {
+                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else if is_active {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{prefix}{}{marker}  {}", l.name, l.root_path),
+                    style,
+                )))
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Library  (j/k, ⏎ confirm, Esc cancel) ");
+        let list = List::new(items).block(block);
+        f.render_widget(list, area);
     }
 
     fn render_sort_picker_overlay(&self, f: &mut Frame) {
@@ -1472,6 +1768,7 @@ impl App {
         lines.push(item("S", "shuffle queue"));
         lines.push(item("R", "cycle repeat (off/all/one)"));
         lines.push(item("F", "rescan library"));
+        lines.push(item("L", "switch library"));
         lines.push(item("?", "toggle this help"));
         lines.push(item("1-4", "switch tabs"));
         lines.push(Line::raw(""));
@@ -1664,8 +1961,22 @@ impl App {
                 style,
             ));
         }
-        let p = Paragraph::new(Line::from(spans));
-        f.render_widget(p, area);
+        let lib = self
+            .current_library_name()
+            .unwrap_or_else(|| "(no library)".into());
+        let row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(lib.chars().count() as u16 + 6)])
+            .split(area);
+        f.render_widget(Paragraph::new(Line::from(spans)), row[0]);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" [{lib}] "),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Right),
+            row[1],
+        );
     }
 
     fn render_settings(&self, f: &mut Frame, area: Rect) {
@@ -1679,6 +1990,9 @@ impl App {
             let val: String = match field {
                 SettingsField::ServerUrl => self.settings.server_url.clone(),
                 SettingsField::AuthToken => self.settings.auth_token.clone(),
+                SettingsField::Library => self
+                    .current_library_name()
+                    .unwrap_or_else(|| "(none)".into()),
             };
             let is_selected = self.settings_field == field;
             let is_editing = matches!(&self.mode, Mode::EditSetting(f, _) if *f == field);
@@ -1974,6 +2288,10 @@ impl App {
             ]),
             Mode::PickPlaylist { .. } => Line::from(Span::styled(
                 "pick playlist (j/k, ⏎ confirm, Esc cancel)",
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::PickLibrary { .. } => Line::from(Span::styled(
+                "pick library (j/k, ⏎ confirm, Esc cancel)",
                 Style::default().fg(Color::Cyan),
             )),
             Mode::SortPicker { .. } => Line::from(Span::styled(

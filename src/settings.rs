@@ -6,6 +6,10 @@ use std::path::PathBuf;
 pub struct Settings {
     pub server_url: String,
     pub auth_token: String,
+    /// Last-selected library, persisted by name (server IDs are not stable
+    /// across reinstalls). Empty until the user picks one.
+    #[serde(default)]
+    pub selected_library: String,
 }
 
 impl Settings {

@@ -6,8 +6,18 @@ use ureq::{Body, RequestBuilder};
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
+pub struct Library {
+    pub id: i64,
+    pub name: String,
+    pub root_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Track {
     pub id: i64,
+    #[serde(default)]
+    pub library_id: i64,
     pub path: String,
     pub title: Option<String>,
     pub album: Option<String>,
@@ -110,24 +120,34 @@ impl Client {
         r
     }
 
-    pub fn search(&self, query: &str) -> Result<Vec<Track>> {
+    pub fn list_libraries(&self) -> Result<Vec<Library>> {
+        let resp = self
+            .get("/api/libraries")
+            .call()
+            .context("GET /api/libraries")?;
+        decode_json(resp, "decode libraries")
+    }
+
+    pub fn search(&self, library_id: i64, query: &str) -> Result<Vec<Track>> {
         let encoded = percent_encode(query);
         let resp = self
-            .get(&format!("/api/search?q={encoded}"))
+            .get(&format!("/api/libraries/{library_id}/search?q={encoded}"))
             .call()
-            .context("GET /api/search")?;
+            .context("GET search")?;
         decode_json(resp, "decode search")
     }
 
-    pub fn list_tracks(&self) -> Result<Vec<Track>> {
+    pub fn list_tracks(&self, library_id: i64) -> Result<Vec<Track>> {
         let mut out = Vec::new();
         let limit = 1000i64;
         let mut offset = 0i64;
         loop {
             let resp = self
-                .get(&format!("/api/tracks?limit={limit}&offset={offset}"))
+                .get(&format!(
+                    "/api/libraries/{library_id}/tracks?limit={limit}&offset={offset}"
+                ))
                 .call()
-                .context("GET /api/tracks")?;
+                .context("GET tracks")?;
             let chunk: Vec<Track> = decode_json(resp, "decode tracks")?;
             let n = chunk.len() as i64;
             out.extend(chunk);
@@ -143,120 +163,152 @@ impl Client {
         format!("{}/api/tracks/{}/stream", self.base, track_id)
     }
 
-    pub fn list_track_tags(&self, track_id: i64) -> Result<Vec<TrackTag>> {
+    pub fn list_track_tags(&self, library_id: i64, track_id: i64) -> Result<Vec<TrackTag>> {
         let resp = self
-            .get(&format!("/api/tracks/{track_id}/tags"))
+            .get(&format!(
+                "/api/libraries/{library_id}/tracks/{track_id}/tags"
+            ))
             .call()
             .context("GET tags")?;
         decode_json(resp, "decode tags")
     }
 
-    pub fn add_user_tag(&self, track_id: i64, namespace: &str, value: &str) -> Result<AddedTag> {
+    pub fn add_user_tag(
+        &self,
+        library_id: i64,
+        track_id: i64,
+        namespace: &str,
+        value: &str,
+    ) -> Result<AddedTag> {
         #[derive(Serialize)]
         struct Body<'a> {
             namespace: &'a str,
             value: &'a str,
         }
         let resp = self
-            .post(&format!("/api/tracks/{track_id}/tags"))
+            .post(&format!(
+                "/api/libraries/{library_id}/tracks/{track_id}/tags"
+            ))
             .send_json(Body { namespace, value })
             .context("POST tag")?;
         decode_json(resp, "decode added tag")
     }
 
-    pub fn remove_user_tag(&self, track_id: i64, tag_id: i64) -> Result<()> {
+    pub fn remove_user_tag(&self, library_id: i64, track_id: i64, tag_id: i64) -> Result<()> {
         let resp = self
-            .delete(&format!("/api/tracks/{track_id}/tags/{tag_id}"))
+            .delete(&format!(
+                "/api/libraries/{library_id}/tracks/{track_id}/tags/{tag_id}"
+            ))
             .call()
             .context("DELETE tag")?;
         ensure_ok(resp)
     }
 
-    pub fn list_playlists(&self) -> Result<Vec<Playlist>> {
-        let resp = self.get("/api/playlists").call().context("GET playlists")?;
+    pub fn list_playlists(&self, library_id: i64) -> Result<Vec<Playlist>> {
+        let resp = self
+            .get(&format!("/api/libraries/{library_id}/playlists"))
+            .call()
+            .context("GET playlists")?;
         decode_json(resp, "decode playlists")
     }
 
-    pub fn create_playlist(&self, name: &str) -> Result<Playlist> {
+    pub fn create_playlist(&self, library_id: i64, name: &str) -> Result<Playlist> {
         #[derive(Serialize)]
         struct Body<'a> {
             name: &'a str,
         }
         let resp = self
-            .post("/api/playlists")
+            .post(&format!("/api/libraries/{library_id}/playlists"))
             .send_json(Body { name })
             .context("POST playlist")?;
         decode_json(resp, "decode playlist")
     }
 
-    pub fn rename_playlist(&self, id: i64, name: &str) -> Result<Playlist> {
+    pub fn rename_playlist(&self, library_id: i64, id: i64, name: &str) -> Result<Playlist> {
         #[derive(Serialize)]
         struct Body<'a> {
             name: &'a str,
         }
         let resp = self
-            .patch(&format!("/api/playlists/{id}"))
+            .patch(&format!("/api/libraries/{library_id}/playlists/{id}"))
             .send_json(Body { name })
             .context("PATCH playlist")?;
         decode_json(resp, "decode playlist")
     }
 
-    pub fn delete_playlist(&self, id: i64) -> Result<()> {
+    pub fn delete_playlist(&self, library_id: i64, id: i64) -> Result<()> {
         let resp = self
-            .delete(&format!("/api/playlists/{id}"))
+            .delete(&format!("/api/libraries/{library_id}/playlists/{id}"))
             .call()
             .context("DELETE playlist")?;
         ensure_ok(resp)
     }
 
-    pub fn get_playlist_tracks(&self, id: i64) -> Result<Vec<PlaylistTrack>> {
+    pub fn get_playlist_tracks(&self, library_id: i64, id: i64) -> Result<Vec<PlaylistTrack>> {
         let resp = self
-            .get(&format!("/api/playlists/{id}/tracks"))
+            .get(&format!(
+                "/api/libraries/{library_id}/playlists/{id}/tracks"
+            ))
             .call()
             .context("GET playlist tracks")?;
         decode_json(resp, "decode playlist tracks")
     }
 
-    pub fn add_to_playlist(&self, playlist_id: i64, track_id: i64) -> Result<()> {
+    pub fn add_to_playlist(&self, library_id: i64, playlist_id: i64, track_id: i64) -> Result<()> {
         #[derive(Serialize)]
         struct Body {
             track_id: i64,
         }
         let resp = self
-            .post(&format!("/api/playlists/{playlist_id}/tracks"))
+            .post(&format!(
+                "/api/libraries/{library_id}/playlists/{playlist_id}/tracks"
+            ))
             .send_json(Body { track_id })
             .context("POST playlist track")?;
         ensure_ok(resp)
     }
 
-    pub fn set_playlist_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<()> {
+    pub fn set_playlist_tracks(
+        &self,
+        library_id: i64,
+        playlist_id: i64,
+        track_ids: &[i64],
+    ) -> Result<()> {
         #[derive(Serialize)]
         struct Body<'a> {
             track_ids: &'a [i64],
         }
         let resp = self
-            .put(&format!("/api/playlists/{playlist_id}/tracks"))
+            .put(&format!(
+                "/api/libraries/{library_id}/playlists/{playlist_id}/tracks"
+            ))
             .send_json(Body { track_ids })
             .context("PUT playlist tracks")?;
         ensure_ok(resp)
     }
 
-    pub fn remove_from_playlist(&self, playlist_id: i64, track_id: i64) -> Result<()> {
+    pub fn remove_from_playlist(
+        &self,
+        library_id: i64,
+        playlist_id: i64,
+        track_id: i64,
+    ) -> Result<()> {
         let resp = self
-            .delete(&format!("/api/playlists/{playlist_id}/tracks/{track_id}"))
+            .delete(&format!(
+                "/api/libraries/{library_id}/playlists/{playlist_id}/tracks/{track_id}"
+            ))
             .call()
             .context("DELETE playlist track")?;
         ensure_ok(resp)
     }
 
-    pub fn trigger_scan(&self) -> Result<ScanState> {
+    pub fn trigger_scan(&self, library_id: i64) -> Result<ScanState> {
         let mut resp = self
-            .post("/api/scans")
+            .post(&format!("/api/libraries/{library_id}/scans"))
             .send_empty()
-            .context("POST /api/scans")?;
+            .context("POST scan")?;
         let status = resp.status();
         if status.as_u16() == 409 {
-            // Already running — return current state if parseable, else generic.
             return resp
                 .body_mut()
                 .read_json::<ScanState>()
@@ -269,8 +321,11 @@ impl Client {
         resp.body_mut().read_json().context("decode scan state")
     }
 
-    pub fn scan_status(&self) -> Result<ScanState> {
-        let resp = self.get("/api/scans").call().context("GET /api/scans")?;
+    pub fn scan_status(&self, library_id: i64) -> Result<ScanState> {
+        let resp = self
+            .get(&format!("/api/libraries/{library_id}/scans"))
+            .call()
+            .context("GET scan")?;
         decode_json(resp, "decode scan state")
     }
 }
@@ -319,6 +374,8 @@ pub struct ScanStats {
 #[allow(dead_code)]
 pub struct Playlist {
     pub id: i64,
+    #[serde(default)]
+    pub library_id: i64,
     pub name: String,
     pub description: Option<String>,
     #[serde(default)]

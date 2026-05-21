@@ -23,6 +23,10 @@ struct Cli {
     /// Bearer token (overrides settings file).
     #[arg(short, long, env = "MUSIC_LIB_TOKEN")]
     token: Option<String>,
+
+    /// Library to select on startup (by name).
+    #[arg(short, long, env = "MUSIC_LIB_LIBRARY")]
+    library: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -35,6 +39,9 @@ fn main() -> Result<()> {
     if let Some(tok) = cli.token {
         s.auth_token = tok;
     }
+    if let Some(lib) = cli.library {
+        s.selected_library = lib;
+    }
     if s.server_url.is_empty() {
         s.server_url = "http://127.0.0.1:7700".into();
     }
@@ -45,13 +52,32 @@ fn main() -> Result<()> {
         Some(s.auth_token.clone())
     };
     let client = api::Client::new(s.server_url.clone(), token_opt.clone());
-    let tracks = match client.list_tracks() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("warning: could not reach {}: {e}", s.server_url);
-            eprintln!("starting with empty library — use the Settings tab to fix.");
-            Vec::new()
-        }
+
+    let libraries = client.list_libraries().unwrap_or_else(|e| {
+        eprintln!("warning: could not list libraries from {}: {e}", s.server_url);
+        eprintln!("starting with empty library — use the Settings tab to fix.");
+        Vec::new()
+    });
+
+    // Resolve selected library: prefer the saved name, else first.
+    let selected = libraries
+        .iter()
+        .find(|l| l.name == s.selected_library)
+        .or_else(|| libraries.first())
+        .cloned();
+    if let Some(ref lib) = selected {
+        s.selected_library = lib.name.clone();
+    }
+
+    let tracks = match &selected {
+        Some(lib) => match client.list_tracks(lib.id) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("warning: list_tracks failed for {}: {e}", lib.name);
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
     };
 
     let mut headers = Vec::new();
@@ -60,7 +86,7 @@ fn main() -> Result<()> {
     }
     let mpv = mpv::Mpv::spawn(&headers).context("spawning mpv")?;
 
-    let mut app = app::App::new(client, mpv, tracks, s);
+    let mut app = app::App::new(client, mpv, tracks, s, libraries, selected.map(|l| l.id));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
