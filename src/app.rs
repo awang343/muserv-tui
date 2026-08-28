@@ -22,6 +22,7 @@ enum Mode {
     PickPlaylist {
         index: usize,
         track_id: i64,
+        containing: Vec<i64>,
     },
     PickLibrary {
         index: usize,
@@ -29,6 +30,14 @@ enum Mode {
     SortPicker {
         index: usize,
     },
+    DownloaderList {
+        index: usize,
+    },
+    DownloaderInput {
+        script: String,
+        buf: String,
+    },
+    DownloaderJob,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +123,7 @@ impl SortKey {
 
     fn label(self) -> &'static str {
         match self {
-            SortKey::Default => "Default (artist / album / track)",
+            SortKey::Default => "Default (artist / title)",
             SortKey::Title => "Title (A→Z)",
             SortKey::Artist => "Artist (A→Z)",
             SortKey::Album => "Album (A→Z)",
@@ -196,9 +205,16 @@ pub struct App {
     status_msg: String,
     show_help: bool,
     show_tags: bool,
+    show_details: bool,
     should_quit: bool,
-    scan_polling: bool,
-    last_scan_poll: Instant,
+    import_polling: bool,
+    last_import_poll: Instant,
+    downloader_scripts: Vec<api::DownloaderInfo>,
+    downloader_script_name: Option<String>,
+    downloader_job_id: Option<String>,
+    downloader_job: Option<api::DownloaderJob>,
+    downloader_polling: bool,
+    last_downloader_poll: Instant,
 }
 
 impl App {
@@ -243,10 +259,18 @@ impl App {
             status_msg: String::new(),
             show_help: false,
             show_tags: false,
+            show_details: false,
             should_quit: false,
-            scan_polling: false,
-            last_scan_poll: Instant::now(),
+            import_polling: false,
+            last_import_poll: Instant::now(),
+            downloader_scripts: Vec::new(),
+            downloader_script_name: None,
+            downloader_job_id: None,
+            downloader_job: None,
+            downloader_polling: false,
+            last_downloader_poll: Instant::now(),
         };
+        app.sort_filtered();
         app.refresh_playlists();
         app
     }
@@ -385,6 +409,15 @@ impl App {
         }
     }
 
+    fn playlists_containing(&self, track_id: i64) -> Vec<i64> {
+        let Some(lib) = self.library_id() else {
+            return Vec::new();
+        };
+        self.client
+            .playlists_containing_track(lib, track_id)
+            .unwrap_or_default()
+    }
+
     pub fn run<B>(&mut self, terminal: &mut ratatui::Terminal<B>) -> Result<()>
     where
         B: ratatui::backend::Backend,
@@ -395,64 +428,67 @@ impl App {
             if event::poll(Duration::from_millis(200))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        self.handle_key(key)?;
+                        if let Err(e) = self.handle_key(key) {
+                            self.status_msg = format!("{e:#}");
+                        }
                     }
                 }
             }
             self.poll_scan_if_due();
+            self.poll_downloader_if_due();
         }
         Ok(())
     }
 
-    fn trigger_rescan(&mut self) {
+    fn trigger_import(&mut self) {
         let Some(lib) = self.library_id() else {
             self.status_msg = "no library selected".into();
             return;
         };
-        match self.client.trigger_scan(lib) {
+        match self.client.trigger_import(lib) {
             Ok(state) => {
                 self.status_msg = if state.running {
-                    "rescanning library…".into()
+                    "importing library…".into()
                 } else {
-                    "scan triggered".into()
+                    "import triggered".into()
                 };
-                self.scan_polling = state.running;
-                self.last_scan_poll = Instant::now();
+                self.import_polling = state.running;
+                self.last_import_poll = Instant::now();
             }
             Err(e) => {
-                self.status_msg = format!("scan: {e}");
+                self.status_msg = format!("import: {e}");
             }
         }
     }
 
     fn poll_scan_if_due(&mut self) {
-        if !self.scan_polling {
+        if !self.import_polling {
             return;
         }
-        if self.last_scan_poll.elapsed() < Duration::from_millis(1500) {
+        if self.last_import_poll.elapsed() < Duration::from_millis(1500) {
             return;
         }
-        self.last_scan_poll = Instant::now();
+        self.last_import_poll = Instant::now();
         let Some(lib) = self.library_id() else {
-            self.scan_polling = false;
+            self.import_polling = false;
             return;
         };
-        let state = match self.client.scan_status(lib) {
+        let state = match self.client.import_status(lib) {
             Ok(s) => s,
             Err(_) => return,
         };
         if state.running {
             return;
         }
-        self.scan_polling = false;
+        self.import_polling = false;
         if let Some(err) = state.last_error {
-            self.status_msg = format!("scan failed: {err}");
+            self.status_msg = format!("import failed: {err}");
             return;
         }
         let summary = state.last_stats.as_ref().map(|s| {
             format!(
-                "scan done: seen={} +{} ~{} ={} fail={}",
-                s.seen, s.inserted, s.updated, s.unchanged, s.failed
+                "import done: scanned={} +{} dup={} fail={}",
+                s.scanned, s.imported, s.duplicates, s.failed
             )
         });
         match self.client.list_tracks(lib) {
@@ -468,16 +504,93 @@ impl App {
                 self.current_tags.clear();
                 self.current_tags_for = None;
                 self.status_msg = summary.unwrap_or_else(|| {
-                    format!("scan done — {} tracks", self.tracks.len())
+                    format!("import done — {} tracks", self.tracks.len())
                 });
             }
             Err(e) => {
                 self.status_msg = format!(
                     "{} (reload failed: {e})",
-                    summary.unwrap_or_else(|| "scan done".into())
+                    summary.unwrap_or_else(|| "import done".into())
                 );
             }
         }
+    }
+
+    fn open_downloader_screen(&mut self) {
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return;
+        };
+        match self.client.list_downloaders(lib) {
+            Ok(scripts) => {
+                self.downloader_scripts = scripts;
+                self.mode = Mode::DownloaderList { index: 0 };
+            }
+            Err(e) => {
+                self.status_msg = format!("downloaders: {e}");
+            }
+        }
+    }
+
+    fn commit_run_downloader(&mut self, script: &str, raw: &str) {
+        let urls: Vec<String> = raw
+            .split(|c: char| c == ',' || c == '\n' || c.is_whitespace())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if urls.is_empty() {
+            self.status_msg = "enter at least one URL".into();
+            return;
+        }
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            self.mode = Mode::Normal;
+            return;
+        };
+        match self.client.run_downloader(lib, script, &urls) {
+            Ok(job_id) => {
+                self.downloader_job_id = Some(job_id);
+                self.downloader_job = None;
+                self.downloader_script_name = Some(script.to_string());
+                self.downloader_polling = true;
+                self.last_downloader_poll = Instant::now();
+                self.status_msg = format!("downloader started: {script}");
+                self.mode = Mode::DownloaderJob;
+            }
+            Err(e) => {
+                self.status_msg = format!("downloader run failed: {e}");
+                self.mode = Mode::DownloaderInput {
+                    script: script.to_string(),
+                    buf: raw.to_string(),
+                };
+            }
+        }
+    }
+
+    fn poll_downloader_if_due(&mut self) {
+        if !self.downloader_polling {
+            return;
+        }
+        if self.last_downloader_poll.elapsed() < Duration::from_millis(1000) {
+            return;
+        }
+        self.last_downloader_poll = Instant::now();
+        let Some(lib) = self.library_id() else {
+            self.downloader_polling = false;
+            return;
+        };
+        let Some(job_id) = self.downloader_job_id.clone() else {
+            self.downloader_polling = false;
+            return;
+        };
+        let job = match self.client.downloader_job_status(lib, &job_id) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        if job.is_done() {
+            self.downloader_polling = false;
+        }
+        self.downloader_job = Some(job);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -595,7 +708,7 @@ impl App {
                 self.mode = Mode::RenamePlaylist(id, buf);
                 return Ok(());
             }
-            Mode::PickPlaylist { mut index, track_id } => {
+            Mode::PickPlaylist { mut index, track_id, containing } => {
                 let len = self.playlists.len();
                 match key.code {
                     KeyCode::Esc => {
@@ -636,7 +749,7 @@ impl App {
                     }
                     _ => {}
                 }
-                self.mode = Mode::PickPlaylist { index, track_id };
+                self.mode = Mode::PickPlaylist { index, track_id, containing };
                 return Ok(());
             }
             Mode::PickLibrary { mut index } => {
@@ -697,6 +810,66 @@ impl App {
                 self.mode = Mode::SortPicker { index };
                 return Ok(());
             }
+            Mode::DownloaderList { mut index } => {
+                let len = self.downloader_scripts.len();
+                match key.code {
+                    KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        return Ok(());
+                    }
+                    KeyCode::Enter => {
+                        if let Some(script) =
+                            self.downloader_scripts.get(index).map(|d| d.name.clone())
+                        {
+                            self.mode = Mode::DownloaderInput {
+                                script,
+                                buf: String::new(),
+                            };
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if len > 0 {
+                            index = (index + 1).min(len - 1);
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        index = index.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                self.mode = Mode::DownloaderList { index };
+                return Ok(());
+            }
+            Mode::DownloaderInput { script, mut buf } => {
+                if matches!(key.code, KeyCode::Esc) {
+                    self.mode = Mode::Normal;
+                    return Ok(());
+                }
+                if matches!(key.code, KeyCode::Enter) {
+                    self.commit_run_downloader(&script, &buf);
+                    return Ok(());
+                }
+                match key.code {
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        buf.push(c);
+                    }
+                    _ => {}
+                }
+                self.mode = Mode::DownloaderInput { script, buf };
+                return Ok(());
+            }
+            Mode::DownloaderJob => {
+                if matches!(key.code, KeyCode::Esc) {
+                    self.mode = Mode::Normal;
+                    self.downloader_polling = false;
+                    return Ok(());
+                }
+                return Ok(());
+            }
             Mode::Normal => {}
         }
 
@@ -727,6 +900,16 @@ impl App {
                 self.mpv.prev()?;
                 return Ok(());
             }
+            (KeyCode::Left, m) => {
+                let secs = if m.contains(KeyModifiers::SHIFT) { -30.0 } else { -5.0 };
+                self.mpv.seek_relative(secs)?;
+                return Ok(());
+            }
+            (KeyCode::Right, m) => {
+                let secs = if m.contains(KeyModifiers::SHIFT) { 30.0 } else { 5.0 };
+                self.mpv.seek_relative(secs)?;
+                return Ok(());
+            }
             (KeyCode::Char('?'), _) => {
                 self.show_help = !self.show_help;
                 return Ok(());
@@ -737,6 +920,10 @@ impl App {
             }
             (KeyCode::Esc, _) if self.show_tags => {
                 self.show_tags = false;
+                return Ok(());
+            }
+            (KeyCode::Esc, _) if self.show_details => {
+                self.show_details = false;
                 return Ok(());
             }
             (KeyCode::Char('S'), _) => {
@@ -757,11 +944,15 @@ impl App {
                 return Ok(());
             }
             (KeyCode::Char('F'), _) => {
-                self.trigger_rescan();
+                self.trigger_import();
                 return Ok(());
             }
             (KeyCode::Char('L'), _) => {
                 self.open_library_picker();
+                return Ok(());
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                self.open_downloader_screen();
                 return Ok(());
             }
             _ => {}
@@ -862,7 +1053,11 @@ impl App {
             KeyCode::Char('a') => {
                 if let Some(idx) = self.playlist_tracks_state.selected() {
                     if let Some(pt) = self.playlist_tracks.get(idx) {
-                        let url = self.client.stream_url(pt.track_id);
+                        let Some(lib) = self.library_id() else {
+                            self.status_msg = "no library selected".into();
+                            return Ok(());
+                        };
+                        let url = self.client.stream_url(lib, pt.track_id);
                         self.mpv.enqueue(&url)?;
                         self.status_msg = format!(
                             "queued: {} — {}",
@@ -996,13 +1191,17 @@ impl App {
             self.status_msg = "playlist is empty".into();
             return Ok(());
         }
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
         let start = start_index.min(self.playlist_tracks.len().saturating_sub(1));
         let first = &self.playlist_tracks[start];
-        let url = self.client.stream_url(first.track_id);
+        let url = self.client.stream_url(lib, first.track_id);
         self.mpv.load(&url)?;
         self.mpv.set_pause(false)?;
         for pt in &self.playlist_tracks[start + 1..] {
-            let u = self.client.stream_url(pt.track_id);
+            let u = self.client.stream_url(lib, pt.track_id);
             self.mpv.enqueue(&u)?;
         }
         let name = self.selected_playlist_name().unwrap_or_default();
@@ -1174,6 +1373,12 @@ impl App {
         if self.show_tags {
             return self.handle_tags_key(key);
         }
+        if self.show_details {
+            if matches!(key.code, KeyCode::Char('i')) {
+                self.show_details = false;
+            }
+            return Ok(());
+        }
         if matches!(key.code, KeyCode::Esc) {
             self.apply_filter("");
             return Ok(());
@@ -1205,13 +1410,19 @@ impl App {
                     if self.playlists.is_empty() {
                         self.status_msg = "no playlists — create one in the Playlists tab".into();
                     } else {
-                        self.mode = Mode::PickPlaylist { index: 0, track_id: t };
+                        let containing = self.playlists_containing(t);
+                        self.mode = Mode::PickPlaylist {
+                            index: 0,
+                            track_id: t,
+                            containing,
+                        };
                     }
                 }
             }
             KeyCode::Char('/') => self.mode = Mode::Filter(String::new()),
             KeyCode::Char('T') => self.mode = Mode::TagSearch(String::new()),
             KeyCode::Char('t') => self.open_tags_popup(),
+            KeyCode::Char('i') => self.open_details_popup(),
             KeyCode::Char('s') => {
                 let index = SortKey::ALL
                     .iter()
@@ -1245,6 +1456,14 @@ impl App {
         }
         self.refresh_tags();
         self.show_tags = true;
+    }
+
+    fn open_details_popup(&mut self) {
+        if self.selected_track().is_none() {
+            self.status_msg = "no track selected".into();
+            return;
+        }
+        self.show_details = true;
     }
 
     fn run_tag_search(&mut self, query: &str) {
@@ -1377,10 +1596,6 @@ impl App {
         let Some(tag) = self.current_tags.get(idx).cloned() else {
             return Ok(());
         };
-        if !tag.is_user() {
-            self.status_msg = format!("can't remove non-user tag {}", tag.display());
-            return Ok(());
-        }
         let Some(track_id) = self.selected_track().map(|t| t.id) else {
             return Ok(());
         };
@@ -1561,7 +1776,11 @@ impl App {
         let Some(track) = self.selected_track().cloned() else {
             return Ok(());
         };
-        let url = self.client.stream_url(track.id);
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        let url = self.client.stream_url(lib, track.id);
         self.mpv.load(&url)?;
         self.mpv.set_pause(false)?;
         Ok(())
@@ -1571,7 +1790,11 @@ impl App {
         let Some(track) = self.selected_track().cloned() else {
             return Ok(());
         };
-        let url = self.client.stream_url(track.id);
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        let url = self.client.stream_url(lib, track.id);
         self.mpv.enqueue(&url)?;
         self.status_msg = format!(
             "queued: {} — {}",
@@ -1586,9 +1809,13 @@ impl App {
             self.status_msg = "nothing to queue".into();
             return Ok(());
         }
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
         let ids: Vec<i64> = self.filtered.iter().map(|&i| self.tracks[i].id).collect();
         for id in &ids {
-            let url = self.client.stream_url(*id);
+            let url = self.client.stream_url(lib, *id);
             self.mpv.enqueue(&url)?;
         }
         self.status_msg = format!("queued {} tracks", ids.len());
@@ -1650,6 +1877,9 @@ impl App {
         if self.tab == Tab::Songs && self.show_tags {
             self.render_tags_overlay(f);
         }
+        if self.tab == Tab::Songs && self.show_details {
+            self.render_details_overlay(f);
+        }
         if self.show_help {
             self.render_help_overlay(f);
         }
@@ -1662,6 +1892,120 @@ impl App {
         if let Mode::SortPicker { .. } = &self.mode {
             self.render_sort_picker_overlay(f);
         }
+        if let Mode::DownloaderList { .. } = &self.mode {
+            self.render_downloader_list_overlay(f);
+        }
+        if let Mode::DownloaderInput { .. } = &self.mode {
+            self.render_downloader_input_overlay(f);
+        }
+        if matches!(self.mode, Mode::DownloaderJob) {
+            self.render_downloader_job_overlay(f);
+        }
+    }
+
+    fn render_downloader_list_overlay(&self, f: &mut Frame) {
+        let Mode::DownloaderList { index } = self.mode else {
+            return;
+        };
+        let area = centered_rect(60, 60, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Downloader scripts  (j/k, ⏎ select, Esc cancel) ");
+
+        if self.downloader_scripts.is_empty() {
+            let text = Paragraph::new("no downloader scripts configured").block(block);
+            f.render_widget(text, area);
+            return;
+        }
+
+        let items: Vec<ListItem> = self
+            .downloader_scripts
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let is_cursor = i == index;
+                let prefix = if is_cursor { "> " } else { "  " };
+                let style = if is_cursor {
+                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(format!("{prefix}{}", d.name), style)))
+            })
+            .collect();
+        let list = List::new(items).block(block);
+        f.render_widget(list, area);
+    }
+
+    fn render_downloader_input_overlay(&self, f: &mut Frame) {
+        let Mode::DownloaderInput { ref script, ref buf } = self.mode else {
+            return;
+        };
+        let area = centered_rect(60, 30, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(" Run {script} — URL(s), comma/space/newline separated "));
+        let lines = vec![
+            Line::from(vec![Span::raw(buf.clone()), Span::raw("_")]),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "⏎ run   Esc cancel",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_downloader_job_overlay(&self, f: &mut Frame) {
+        let area = centered_rect(80, 80, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let script = self.downloader_script_name.as_deref().unwrap_or("?");
+        let status = self
+            .downloader_job
+            .as_ref()
+            .map(|j| j.status.as_str())
+            .unwrap_or("starting…");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(" Downloader — {script} ({status})  (Esc to close) "));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(job) = &self.downloader_job {
+            let extra = if job.summary.is_some() { 2 } else { 0 };
+            let max_log = (inner.height as usize).saturating_sub(extra).max(1);
+            let start = job.log.len().saturating_sub(max_log);
+            for l in &job.log[start..] {
+                lines.push(Line::raw(l.clone()));
+            }
+            if let Some(s) = &job.summary {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "import: scanned={} +{} dup={} fail={}",
+                        s.scanned, s.imported, s.duplicates, s.failed
+                    ),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                )));
+            } else if job.status == "failed" {
+                lines.push(Line::from(Span::styled(
+                    "job failed",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )));
+            }
+        } else {
+            lines.push(Line::raw("starting…"));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_pick_library_overlay(&self, f: &mut Frame) {
@@ -1688,7 +2032,7 @@ impl App {
                     Style::default()
                 };
                 ListItem::new(Line::from(Span::styled(
-                    format!("{prefix}{}{marker}  {}", l.name, l.root_path),
+                    format!("{prefix}{}{marker}  {}", l.name, l.path),
                     style,
                 )))
             })
@@ -1765,10 +2109,12 @@ impl App {
         lines.push(item("q / Ctrl+C", "quit"));
         lines.push(item("space", "play / pause"));
         lines.push(item("n / p", "next / previous"));
+        lines.push(item("← / →", "seek ±5s  (Shift: ±30s)"));
         lines.push(item("S", "shuffle queue"));
         lines.push(item("R", "cycle repeat (off/all/one)"));
-        lines.push(item("F", "rescan library"));
+        lines.push(item("F", "import library"));
         lines.push(item("L", "switch library"));
+        lines.push(item("Ctrl+D", "run downloader script"));
         lines.push(item("?", "toggle this help"));
         lines.push(item("1-4", "switch tabs"));
         lines.push(Line::raw(""));
@@ -1782,6 +2128,9 @@ impl App {
                     lines.push(item("a", "add tag"));
                     lines.push(item("d", "remove user tag"));
                     lines.push(item("t / Esc", "close tags popup"));
+                } else if self.show_details {
+                    lines.push(header("Songs — details popup"));
+                    lines.push(item("i / Esc", "close details popup"));
                 } else {
                     lines.push(header("Songs"));
                     lines.push(item("j/k, PgUp/Dn", "move selection"));
@@ -1791,6 +2140,7 @@ impl App {
                     lines.push(item("E", "queue all (filtered)"));
                     lines.push(item("A", "add to playlist"));
                     lines.push(item("t", "show tags for selected"));
+                    lines.push(item("i", "show details for selected"));
                     lines.push(item("/", "filter"));
                     lines.push(item("T", "tag search"));
                     lines.push(item("s", "sort by…"));
@@ -1908,7 +2258,7 @@ impl App {
     }
 
     fn render_pick_playlist_overlay(&self, f: &mut Frame) {
-        let Mode::PickPlaylist { index, .. } = self.mode else {
+        let Mode::PickPlaylist { index, ref containing, .. } = self.mode else {
             return;
         };
         let area = centered_rect(60, 60, f.area());
@@ -1920,13 +2270,17 @@ impl App {
             .enumerate()
             .map(|(i, p)| {
                 let prefix = if i == index { "> " } else { "  " };
+                let member = containing.contains(&p.id);
+                let marker = if member { "✓ " } else { "  " };
                 let style = if i == index {
                     Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else if member {
+                    Style::default().fg(Color::Green)
                 } else {
                     Style::default()
                 };
                 ListItem::new(Line::from(Span::styled(
-                    format!("{prefix}{}  ({})", p.name, p.track_count),
+                    format!("{prefix}{marker}{}  ({})", p.name, p.track_count),
                     style,
                 )))
             })
@@ -2110,11 +2464,6 @@ impl App {
                     ),
                     Span::raw("  "),
                     Span::raw(t.display_title().to_string()),
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("[{}]", t.display_album()),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
                 ]);
                 ListItem::new(line)
             })
@@ -2142,15 +2491,9 @@ impl App {
             .current_tags
             .iter()
             .map(|t| {
-                let style = if t.is_user() {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().add_modifier(Modifier::DIM)
-                };
-                let badge = if t.is_user() { " *" } else { "" };
                 ListItem::new(Line::from(vec![Span::styled(
-                    format!("{}{}", t.display(), badge),
-                    style,
+                    t.display(),
+                    Style::default().fg(Color::Green),
                 )]))
             })
             .collect();
@@ -2171,6 +2514,85 @@ impl App {
             .block(block)
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, area, &mut self.tags_state);
+    }
+
+    fn render_details_overlay(&self, f: &mut Frame) {
+        let Some(t) = self.selected_track() else {
+            return;
+        };
+        let area = centered_rect(70, 70, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let dash = "—".to_string();
+        let duration = t
+            .duration_ms
+            .map(|ms| fmt_time(ms as f64 / 1000.0))
+            .unwrap_or_else(|| dash.clone());
+        let track_no = match (t.track_no, t.disc_no) {
+            (Some(tn), Some(dn)) => format!("{dn}.{tn}"),
+            (Some(tn), None) => tn.to_string(),
+            (None, Some(dn)) => format!("disc {dn}"),
+            _ => dash.clone(),
+        };
+        let bitrate = t
+            .bitrate
+            .map(|b| format!("{} kbps", b / 1000))
+            .unwrap_or_else(|| dash.clone());
+        let sample_rate = t
+            .sample_rate
+            .map(|s| format!("{:.1} kHz", s as f64 / 1000.0))
+            .unwrap_or_else(|| dash.clone());
+        let channels = t.channels.map(|c| c.to_string()).unwrap_or_else(|| dash.clone());
+        let year = t.year.map(|y| y.to_string()).unwrap_or_else(|| dash.clone());
+        let format = t
+            .original_filename
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).extension())
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_uppercase())
+            .unwrap_or_else(|| dash.clone());
+        let added = if t.added_at > 0 {
+            fmt_unix_utc(t.added_at)
+        } else {
+            dash.clone()
+        };
+
+        let rows: Vec<(&str, String)> = vec![
+            ("Title", t.title.clone().unwrap_or_else(|| dash.clone())),
+            ("Artist", t.artist.clone().unwrap_or_else(|| dash.clone())),
+            ("Album artist", t.album_artist.clone().unwrap_or_else(|| dash.clone())),
+            ("Album", t.album.clone().unwrap_or_else(|| dash.clone())),
+            ("Year", year),
+            ("Track", track_no),
+            ("Duration", duration),
+            ("Format", format),
+            ("Bitrate", bitrate),
+            ("Sample rate", sample_rate),
+            ("Channels", channels),
+            ("Added", added),
+            ("Track ID", t.id.to_string()),
+            ("File", t.original_filename.clone().unwrap_or_else(|| dash.clone())),
+        ];
+
+        let label_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() + 1);
+        lines.push(Line::raw(""));
+        for (k, v) in rows {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:<width$}  ", k, width = label_w),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(v),
+            ]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Song details  (i / Esc to close) ");
+        f.render_widget(Paragraph::new(lines).block(block), area);
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -2298,6 +2720,19 @@ impl App {
                 "sort songs (j/k, ⏎ confirm, Esc cancel)",
                 Style::default().fg(Color::Cyan),
             )),
+            Mode::DownloaderList { .. } => Line::from(Span::styled(
+                "pick downloader script (j/k, ⏎ select, Esc cancel)",
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::DownloaderInput { script, buf } => Line::from(vec![
+                Span::styled(format!("run {script}: "), Style::default().fg(Color::Green)),
+                Span::raw(buf.clone()),
+                Span::raw("_"),
+            ]),
+            Mode::DownloaderJob => Line::from(Span::styled(
+                "downloader job (Esc to close — keeps running in background)",
+                Style::default().fg(Color::Cyan),
+            )),
             Mode::Normal => Line::raw(""),
         }
     }
@@ -2325,18 +2760,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 fn cmp_tracks(a: &Track, b: &Track, key: SortKey) -> std::cmp::Ordering {
     let s = |x: &str| x.to_lowercase();
     match key {
-        SortKey::Default => {
-            let aa = a.album_artist.as_deref().unwrap_or("");
-            let ba = b.album_artist.as_deref().unwrap_or("");
-            s(aa).cmp(&s(ba))
-                .then_with(|| {
-                    s(a.album.as_deref().unwrap_or(""))
-                        .cmp(&s(b.album.as_deref().unwrap_or("")))
-                })
-                .then(a.disc_no.unwrap_or(0).cmp(&b.disc_no.unwrap_or(0)))
-                .then(a.track_no.unwrap_or(0).cmp(&b.track_no.unwrap_or(0)))
-                .then_with(|| s(a.display_title()).cmp(&s(b.display_title())))
-        }
+        SortKey::Default => s(a.display_artist())
+            .cmp(&s(b.display_artist()))
+            .then_with(|| s(a.display_title()).cmp(&s(b.display_title()))),
         SortKey::Title => s(a.display_title()).cmp(&s(b.display_title())),
         SortKey::Artist => s(a.display_artist())
             .cmp(&s(b.display_artist()))
@@ -2406,6 +2832,28 @@ fn fmt_tag(ns: &str, val: &str) -> String {
     } else {
         format!("{ns}:{val}")
     }
+}
+
+fn fmt_unix_utc(ts: i64) -> String {
+    let days = ts.div_euclid(86400);
+    let secs = ts.rem_euclid(86400);
+    let hh = secs / 3600;
+    let mm = (secs / 60) % 60;
+
+    // Howard Hinnant's days-from-civil, inverted.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = (z - era * 146097) as i64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
 fn fmt_time(secs: f64) -> String {

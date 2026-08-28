@@ -38,16 +38,19 @@ impl Mpv {
             .join(format!("mutui-mpv-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket_path);
 
+        let log_stderr = open_mpv_log().unwrap_or_else(|_| Stdio::null());
+        let log_stdout = open_mpv_log().unwrap_or_else(|_| Stdio::null());
+
         let mut cmd = Command::new("mpv");
         cmd.arg("--idle=yes")
             .arg("--no-video")
             .arg("--no-terminal")
-            .arg("--really-quiet")
+            .arg("--msg-level=all=warn")
             .arg("--audio-display=no")
             .arg(format!("--input-ipc-server={}", socket_path.display()))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(log_stdout)
+            .stderr(log_stderr);
 
         // Opportunistic MPRIS — load mpv-mpris if installed so playerctl works.
         for c in [
@@ -242,6 +245,10 @@ impl Mpv {
         self.send(json!({"command": ["set_property", "pause", paused]}))
     }
 
+    pub fn seek_relative(&mut self, secs: f64) -> Result<()> {
+        self.send(json!({"command": ["seek", secs, "relative"]}))
+    }
+
     pub fn set_http_headers(&mut self, headers: &[String]) -> Result<()> {
         self.send(json!({
             "command": ["set_property", "http-header-fields", headers]
@@ -259,6 +266,21 @@ impl Drop for Mpv {
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+fn open_mpv_log() -> Result<Stdio> {
+    let dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME not set"))?
+        .join(".local/share/muserv");
+    std::fs::create_dir_all(&dir).context("create muserv data dir")?;
+    let path = dir.join("mpv.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open mpv log {}", path.display()))?;
+    Ok(Stdio::from(file))
 }
 
 fn shuffle_in_place<T>(v: &mut [T]) {

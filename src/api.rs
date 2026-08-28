@@ -9,7 +9,7 @@ use ureq::{Body, RequestBuilder};
 pub struct Library {
     pub id: i64,
     pub name: String,
-    pub root_path: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -17,8 +17,9 @@ pub struct Library {
 pub struct Track {
     pub id: i64,
     #[serde(default)]
-    pub library_id: i64,
-    pub path: String,
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub original_filename: Option<String>,
     pub title: Option<String>,
     pub album: Option<String>,
     pub artist: Option<String>,
@@ -28,17 +29,21 @@ pub struct Track {
     pub duration_ms: Option<i64>,
     pub year: Option<i64>,
     #[serde(default)]
+    pub bitrate: Option<i64>,
+    #[serde(default)]
+    pub sample_rate: Option<i64>,
+    #[serde(default)]
+    pub channels: Option<i64>,
+    #[serde(default)]
     pub added_at: i64,
 }
 
 impl Track {
     pub fn display_title(&self) -> &str {
-        self.title.as_deref().unwrap_or_else(|| {
-            self.path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&self.path)
-        })
+        self.title
+            .as_deref()
+            .or(self.original_filename.as_deref())
+            .unwrap_or("(untitled)")
     }
     pub fn display_artist(&self) -> &str {
         self.artist
@@ -159,8 +164,11 @@ impl Client {
         Ok(out)
     }
 
-    pub fn stream_url(&self, track_id: i64) -> String {
-        format!("{}/api/tracks/{}/stream", self.base, track_id)
+    pub fn stream_url(&self, library_id: i64, track_id: i64) -> String {
+        format!(
+            "{}/api/libraries/{}/tracks/{}/stream",
+            self.base, library_id, track_id
+        )
     }
 
     pub fn list_track_tags(&self, library_id: i64, track_id: i64) -> Result<Vec<TrackTag>> {
@@ -254,6 +262,20 @@ impl Client {
         decode_json(resp, "decode playlist tracks")
     }
 
+    pub fn playlists_containing_track(
+        &self,
+        library_id: i64,
+        track_id: i64,
+    ) -> Result<Vec<i64>> {
+        let resp = self
+            .get(&format!(
+                "/api/libraries/{library_id}/tracks/{track_id}/playlists"
+            ))
+            .call()
+            .context("GET track playlists")?;
+        decode_json(resp, "decode track playlists")
+    }
+
     pub fn add_to_playlist(&self, library_id: i64, playlist_id: i64, track_id: i64) -> Result<()> {
         #[derive(Serialize)]
         struct Body {
@@ -302,31 +324,68 @@ impl Client {
         ensure_ok(resp)
     }
 
-    pub fn trigger_scan(&self, library_id: i64) -> Result<ScanState> {
+    pub fn trigger_import(&self, library_id: i64) -> Result<ImportState> {
         let mut resp = self
-            .post(&format!("/api/libraries/{library_id}/scans"))
+            .post(&format!("/api/libraries/{library_id}/import"))
             .send_empty()
-            .context("POST scan")?;
+            .context("POST import")?;
         let status = resp.status();
         if status.as_u16() == 409 {
             return resp
                 .body_mut()
-                .read_json::<ScanState>()
+                .read_json::<ImportState>()
                 .map_err(|_| anyhow::anyhow!("already running"));
         }
         if !status.is_success() {
             let msg = resp.body_mut().read_to_string().unwrap_or_default();
             anyhow::bail!("server: {msg}");
         }
-        resp.body_mut().read_json().context("decode scan state")
+        resp.body_mut().read_json().context("decode import state")
     }
 
-    pub fn scan_status(&self, library_id: i64) -> Result<ScanState> {
+    pub fn import_status(&self, library_id: i64) -> Result<ImportState> {
         let resp = self
-            .get(&format!("/api/libraries/{library_id}/scans"))
+            .get(&format!("/api/libraries/{library_id}/import"))
             .call()
-            .context("GET scan")?;
-        decode_json(resp, "decode scan state")
+            .context("GET import")?;
+        decode_json(resp, "decode import state")
+    }
+
+    pub fn list_downloaders(&self, library_id: i64) -> Result<Vec<DownloaderInfo>> {
+        let resp = self
+            .get(&format!("/api/libraries/{library_id}/downloaders"))
+            .call()
+            .context("GET downloaders")?;
+        decode_json(resp, "decode downloaders")
+    }
+
+    pub fn run_downloader(&self, library_id: i64, name: &str, urls: &[String]) -> Result<String> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            urls: &'a [String],
+        }
+        #[derive(Deserialize)]
+        struct RunResponse {
+            job_id: String,
+        }
+        let resp = self
+            .post(&format!(
+                "/api/libraries/{library_id}/downloaders/{name}/run"
+            ))
+            .send_json(Body { urls })
+            .context("POST downloader run")?;
+        let r: RunResponse = decode_json(resp, "decode run response")?;
+        Ok(r.job_id)
+    }
+
+    pub fn downloader_job_status(&self, library_id: i64, job_id: &str) -> Result<DownloaderJob> {
+        let resp = self
+            .get(&format!(
+                "/api/libraries/{library_id}/downloaders/jobs/{job_id}"
+            ))
+            .call()
+            .context("GET downloader job")?;
+        decode_json(resp, "decode downloader job")
     }
 }
 
@@ -353,29 +412,51 @@ fn ensure_ok(mut resp: Response<Body>) -> Result<()> {
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
-pub struct ScanState {
+pub struct ImportState {
     pub running: bool,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
-    pub last_stats: Option<ScanStats>,
+    pub last_stats: Option<ImportStats>,
     pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ScanStats {
-    pub seen: u64,
-    pub inserted: u64,
-    pub updated: u64,
-    pub unchanged: u64,
+pub struct ImportStats {
+    pub scanned: u64,
+    pub imported: u64,
+    pub duplicates: u64,
     pub failed: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DownloaderInfo {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct DownloaderJob {
+    pub id: String,
+    pub script: String,
+    pub urls: Vec<String>,
+    pub current_index: Option<usize>,
+    pub status: String,
+    pub log: Vec<String>,
+    pub summary: Option<ImportStats>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+impl DownloaderJob {
+    pub fn is_done(&self) -> bool {
+        self.status == "completed" || self.status == "failed"
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct Playlist {
     pub id: i64,
-    #[serde(default)]
-    pub library_id: i64,
     pub name: String,
     pub description: Option<String>,
     #[serde(default)]
@@ -414,7 +495,6 @@ pub struct TrackTag {
     pub tag_id: i64,
     pub namespace: String,
     pub value: String,
-    pub source: String,
 }
 
 impl TrackTag {
@@ -424,9 +504,6 @@ impl TrackTag {
         } else {
             format!("{}:{}", self.namespace, self.value)
         }
-    }
-    pub fn is_user(&self) -> bool {
-        self.source == "user"
     }
 }
 
