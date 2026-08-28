@@ -207,8 +207,6 @@ pub struct App {
     show_tags: bool,
     show_details: bool,
     should_quit: bool,
-    import_polling: bool,
-    last_import_poll: Instant,
     downloader_scripts: Vec<api::DownloaderInfo>,
     downloader_script_name: Option<String>,
     downloader_job_id: Option<String>,
@@ -261,8 +259,6 @@ impl App {
             show_tags: false,
             show_details: false,
             should_quit: false,
-            import_polling: false,
-            last_import_poll: Instant::now(),
             downloader_scripts: Vec::new(),
             downloader_script_name: None,
             downloader_job_id: None,
@@ -434,86 +430,9 @@ impl App {
                     }
                 }
             }
-            self.poll_scan_if_due();
             self.poll_downloader_if_due();
         }
         Ok(())
-    }
-
-    fn trigger_import(&mut self) {
-        let Some(lib) = self.library_id() else {
-            self.status_msg = "no library selected".into();
-            return;
-        };
-        match self.client.trigger_import(lib) {
-            Ok(state) => {
-                self.status_msg = if state.running {
-                    "importing library…".into()
-                } else {
-                    "import triggered".into()
-                };
-                self.import_polling = state.running;
-                self.last_import_poll = Instant::now();
-            }
-            Err(e) => {
-                self.status_msg = format!("import: {e}");
-            }
-        }
-    }
-
-    fn poll_scan_if_due(&mut self) {
-        if !self.import_polling {
-            return;
-        }
-        if self.last_import_poll.elapsed() < Duration::from_millis(1500) {
-            return;
-        }
-        self.last_import_poll = Instant::now();
-        let Some(lib) = self.library_id() else {
-            self.import_polling = false;
-            return;
-        };
-        let state = match self.client.import_status(lib) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        if state.running {
-            return;
-        }
-        self.import_polling = false;
-        if let Some(err) = state.last_error {
-            self.status_msg = format!("import failed: {err}");
-            return;
-        }
-        let summary = state.last_stats.as_ref().map(|s| {
-            format!(
-                "import done: scanned={} +{} dup={} fail={}",
-                s.scanned, s.imported, s.duplicates, s.failed
-            )
-        });
-        match self.client.list_tracks(lib) {
-            Ok(t) => {
-                self.tracks = t;
-                let prev_id = self.selected_track().map(|t| t.id);
-                self.apply_filter("");
-                if let Some(id) = prev_id {
-                    if let Some(pos) = self.filtered.iter().position(|&i| self.tracks[i].id == id) {
-                        self.list_state.select(Some(pos));
-                    }
-                }
-                self.current_tags.clear();
-                self.current_tags_for = None;
-                self.status_msg = summary.unwrap_or_else(|| {
-                    format!("import done — {} tracks", self.tracks.len())
-                });
-            }
-            Err(e) => {
-                self.status_msg = format!(
-                    "{} (reload failed: {e})",
-                    summary.unwrap_or_else(|| "import done".into())
-                );
-            }
-        }
     }
 
     fn open_downloader_screen(&mut self) {
@@ -941,10 +860,6 @@ impl App {
                 self.mpv.set_loop_playlist(lp)?;
                 self.mpv.set_loop_file(lf)?;
                 self.status_msg = self.repeat.status_label().into();
-                return Ok(());
-            }
-            (KeyCode::Char('F'), _) => {
-                self.trigger_import();
                 return Ok(());
             }
             (KeyCode::Char('L'), _) => {
@@ -2112,7 +2027,6 @@ impl App {
         lines.push(item("← / →", "seek ±5s  (Shift: ±30s)"));
         lines.push(item("S", "shuffle queue"));
         lines.push(item("R", "cycle repeat (off/all/one)"));
-        lines.push(item("F", "import library"));
         lines.push(item("L", "switch library"));
         lines.push(item("Ctrl+D", "run downloader script"));
         lines.push(item("?", "toggle this help"));

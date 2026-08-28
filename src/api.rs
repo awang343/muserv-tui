@@ -324,33 +324,6 @@ impl Client {
         ensure_ok(resp)
     }
 
-    pub fn trigger_import(&self, library_id: i64) -> Result<ImportState> {
-        let mut resp = self
-            .post(&format!("/api/libraries/{library_id}/import"))
-            .send_empty()
-            .context("POST import")?;
-        let status = resp.status();
-        if status.as_u16() == 409 {
-            return resp
-                .body_mut()
-                .read_json::<ImportState>()
-                .map_err(|_| anyhow::anyhow!("already running"));
-        }
-        if !status.is_success() {
-            let msg = resp.body_mut().read_to_string().unwrap_or_default();
-            anyhow::bail!("server: {msg}");
-        }
-        resp.body_mut().read_json().context("decode import state")
-    }
-
-    pub fn import_status(&self, library_id: i64) -> Result<ImportState> {
-        let resp = self
-            .get(&format!("/api/libraries/{library_id}/import"))
-            .call()
-            .context("GET import")?;
-        decode_json(resp, "decode import state")
-    }
-
     pub fn list_downloaders(&self, library_id: i64) -> Result<Vec<DownloaderInfo>> {
         let resp = self
             .get(&format!("/api/libraries/{library_id}/downloaders"))
@@ -408,16 +381,6 @@ fn ensure_ok(mut resp: Response<Body>) -> Result<()> {
         anyhow::bail!("status {}: {msg}", status.as_u16());
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct ImportState {
-    pub running: bool,
-    pub started_at: Option<i64>,
-    pub finished_at: Option<i64>,
-    pub last_stats: Option<ImportStats>,
-    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
