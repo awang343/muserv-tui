@@ -10,6 +10,14 @@ impl App {
             return Ok(());
         }
         if matches!(key.code, KeyCode::Esc) && self.playlists_focus == PlaylistsFocus::Tracks {
+            if self.playlist_select.in_range() {
+                self.playlist_select.end_range();
+                return Ok(());
+            }
+            if self.playlist_select.count() > 0 {
+                self.playlist_select.clear();
+                return Ok(());
+            }
             self.playlists_focus = PlaylistsFocus::List;
             return Ok(());
         }
@@ -79,38 +87,106 @@ impl App {
                     self.playlist_tracks_state.select(Some(len - 1));
                 }
             }
+            KeyCode::Char('x') => {
+                if let Some(idx) = self.playlist_tracks_state.selected() {
+                    if let Some(pt) = self.playlist_tracks.get(idx) {
+                        self.playlist_select.toggle(pt.position);
+                    }
+                }
+            }
+            KeyCode::Char('V') => {
+                if self.playlist_select.in_range() {
+                    self.playlist_select.end_range();
+                } else if let Some(idx) = self.playlist_tracks_state.selected() {
+                    if let Some(pt) = self.playlist_tracks.get(idx) {
+                        self.playlist_select.start_range(idx, pt.position);
+                    }
+                }
+            }
             KeyCode::Enter => {
                 if let Some(idx) = self.playlist_tracks_state.selected() {
                     self.play_selected_playlist(idx)?;
                 }
             }
-            KeyCode::Char('a') => {
-                if let Some(idx) = self.playlist_tracks_state.selected() {
-                    if let Some(pt) = self.playlist_tracks.get(idx) {
-                        let Some(lib) = self.library_id() else {
-                            self.status_msg = "no library selected".into();
-                            return Ok(());
-                        };
-                        let url = self.resolve_track_url(lib, pt.track_id);
-                        self.mpv.enqueue(&url)?;
-                        self.status_msg =
-                            format!("queued: {} — {}", pt.display_artist(), pt.display_title());
-                    }
-                }
-            }
-            KeyCode::Char('d') => self.remove_selected_playlist_track()?,
+            KeyCode::Char('a') => self.enqueue_playlist_selection()?,
+            KeyCode::Char('d') => self.remove_playlist_selection()?,
             KeyCode::Char('J') => self.move_playlist_track(1)?,
             KeyCode::Char('K') => self.move_playlist_track(-1)?,
-            KeyCode::Char('o') => {
-                if let Some(idx) = self.playlist_tracks_state.selected() {
-                    if let Some(track_id) = self.playlist_tracks.get(idx).map(|pt| pt.track_id) {
-                        self.start_download(track_id);
-                    }
-                }
-            }
+            KeyCode::Char('o') => self.download_playlist_selection(),
             KeyCode::Char('O') => self.download_selected_playlist(),
             _ => {}
         }
+        if self.playlist_select.in_range() {
+            if let Some(idx) = self.playlist_tracks_state.selected() {
+                let ids: Vec<i64> = self.playlist_tracks.iter().map(|pt| pt.position).collect();
+                self.playlist_select.extend_range(idx, &ids);
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn enqueue_playlist_selection(&mut self) -> Result<()> {
+        if self.playlist_select.count() == 0 {
+            if let Some(idx) = self.playlist_tracks_state.selected() {
+                if let Some(pt) = self.playlist_tracks.get(idx) {
+                    let Some(lib) = self.library_id() else {
+                        self.status_msg = "no library selected".into();
+                        return Ok(());
+                    };
+                    let url = self.resolve_track_url(lib, pt.track_id);
+                    self.mpv.enqueue(&url)?;
+                    self.status_msg =
+                        format!("queued: {} — {}", pt.display_artist(), pt.display_title());
+                }
+            }
+            return Ok(());
+        }
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        let ids: Vec<i64> = self
+            .playlist_tracks
+            .iter()
+            .filter(|pt| self.playlist_select.is_selected(pt.position))
+            .map(|pt| pt.track_id)
+            .collect();
+        let count = ids.len();
+        for id in ids {
+            let url = self.resolve_track_url(lib, id);
+            self.mpv.enqueue(&url)?;
+        }
+        self.status_msg = format!("queued {count} tracks");
+        self.playlist_select.clear();
+        Ok(())
+    }
+    pub(super) fn remove_playlist_selection(&mut self) -> Result<()> {
+        if self.playlist_select.count() == 0 {
+            return self.remove_selected_playlist_track();
+        }
+        let Some(pid) = self.selected_playlist_id() else {
+            return Ok(());
+        };
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        let track_ids: Vec<i64> = self
+            .playlist_tracks
+            .iter()
+            .filter(|pt| self.playlist_select.is_selected(pt.position))
+            .map(|pt| pt.track_id)
+            .collect();
+        let total = track_ids.len();
+        let mut removed = 0;
+        for tid in track_ids {
+            if self.client.remove_from_playlist(lib, pid, tid).is_ok() {
+                removed += 1;
+            }
+        }
+        self.playlist_select.clear();
+        self.status_msg = format!("removed {removed}/{total} from playlist");
+        self.refresh_playlist_tracks();
+        self.refresh_playlists();
         Ok(())
     }
     pub(super) fn move_playlist_track(&mut self, delta: i32) -> Result<()> {
@@ -132,6 +208,7 @@ impl App {
             pt.position = i as i64;
         }
         self.playlist_tracks_state.select(Some(new_idx));
+        self.playlist_select.clear();
 
         let track_ids: Vec<i64> = self.playlist_tracks.iter().map(|p| p.track_id).collect();
         let Some(lib) = self.library_id() else {

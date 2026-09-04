@@ -10,8 +10,60 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Default)]
+struct MultiSelect {
+    ids: HashSet<i64>,
+    anchor: Option<usize>,
+}
+
+impl MultiSelect {
+    fn is_selected(&self, id: i64) -> bool {
+        self.ids.contains(&id)
+    }
+    fn toggle(&mut self, id: i64) {
+        if !self.ids.remove(&id) {
+            self.ids.insert(id);
+        }
+    }
+    fn clear(&mut self) {
+        self.ids.clear();
+        self.anchor = None;
+    }
+    fn count(&self) -> usize {
+        self.ids.len()
+    }
+    fn in_range(&self) -> bool {
+        self.anchor.is_some()
+    }
+    fn start_range(&mut self, index: usize, id: i64) {
+        self.anchor = Some(index);
+        self.ids.insert(id);
+    }
+    fn end_range(&mut self) {
+        self.anchor = None;
+    }
+    fn extend_range(&mut self, cursor: usize, ids_in_order: &[i64]) {
+        let Some(anchor) = self.anchor else { return };
+        let (lo, hi) = if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        for id in ids_in_order.iter().skip(lo).take(hi - lo + 1) {
+            self.ids.insert(*id);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum UploadStage {
+    List { index: usize },
+    Input { script: String, buf: String },
+    Job,
+}
 
 #[derive(Debug, Clone)]
 struct DownloadState {
@@ -46,7 +98,7 @@ enum Mode {
     RenamePlaylist(i64, String),
     PickPlaylist {
         index: usize,
-        track_id: i64,
+        track_ids: Vec<i64>,
         containing: Vec<i64>,
     },
     PickLibrary {
@@ -55,14 +107,6 @@ enum Mode {
     SortPicker {
         index: usize,
     },
-    DownloaderList {
-        index: usize,
-    },
-    DownloaderInput {
-        script: String,
-        buf: String,
-    },
-    DownloaderJob,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,15 +221,17 @@ enum Tab {
     Playlists,
     Queue,
     Downloads,
+    Uploads,
     Settings,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [
+    const ALL: [Tab; 6] = [
         Tab::Songs,
         Tab::Playlists,
         Tab::Queue,
         Tab::Downloads,
+        Tab::Uploads,
         Tab::Settings,
     ];
 
@@ -195,6 +241,7 @@ impl Tab {
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
             Tab::Downloads => "Downloads",
+            Tab::Uploads => "Uploads",
             Tab::Settings => "Settings",
         }
     }
@@ -205,7 +252,8 @@ impl Tab {
             '2' => Some(Tab::Playlists),
             '3' => Some(Tab::Queue),
             '4' => Some(Tab::Downloads),
-            '5' => Some(Tab::Settings),
+            '5' => Some(Tab::Uploads),
+            '6' => Some(Tab::Settings),
             _ => None,
         }
     }
@@ -220,6 +268,10 @@ pub struct App {
     tags_state: ListState,
     queue_state: ListState,
     downloads_state: ListState,
+    songs_select: MultiSelect,
+    playlist_select: MultiSelect,
+    downloads_select: MultiSelect,
+    upload_stage: UploadStage,
     tab: Tab,
     mode: Mode,
     settings: Settings,
@@ -289,6 +341,10 @@ impl App {
             tags_state: ListState::default(),
             queue_state: ListState::default(),
             downloads_state: ListState::default(),
+            songs_select: MultiSelect::default(),
+            playlist_select: MultiSelect::default(),
+            downloads_select: MultiSelect::default(),
+            upload_stage: UploadStage::List { index: 0 },
             tab: Tab::Songs,
             mode: Mode::Normal,
             saved_settings: settings.clone(),

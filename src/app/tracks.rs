@@ -12,6 +12,14 @@ impl App {
             return Ok(());
         }
         if matches!(key.code, KeyCode::Esc) {
+            if self.songs_select.in_range() {
+                self.songs_select.end_range();
+                return Ok(());
+            }
+            if self.songs_select.count() > 0 {
+                self.songs_select.clear();
+                return Ok(());
+            }
             self.apply_filter("");
             return Ok(());
         }
@@ -33,18 +41,45 @@ impl App {
                     self.list_state.select(Some(self.filtered.len() - 1));
                 }
             }
+            KeyCode::Char('x') => {
+                if let Some(t) = self.selected_track().map(|t| t.id) {
+                    self.songs_select.toggle(t);
+                }
+            }
+            KeyCode::Char('V') => {
+                if self.songs_select.in_range() {
+                    self.songs_select.end_range();
+                } else if let Some(idx) = self.list_state.selected() {
+                    if let Some(t) = self.selected_track().map(|t| t.id) {
+                        self.songs_select.start_range(idx, t);
+                    }
+                }
+            }
             KeyCode::Enter => self.play_selected()?,
-            KeyCode::Char('a') => self.enqueue_selected()?,
+            KeyCode::Char('a') => self.enqueue_songs_selection()?,
             KeyCode::Char('E') => self.enqueue_all_filtered()?,
             KeyCode::Char('A') => {
-                if let Some(t) = self.selected_track().map(|t| t.id) {
+                let ids: Vec<i64> = if self.songs_select.count() > 0 {
+                    self.filtered
+                        .iter()
+                        .map(|&i| self.tracks[i].id)
+                        .filter(|id| self.songs_select.is_selected(*id))
+                        .collect()
+                } else {
+                    self.selected_track().map(|t| t.id).into_iter().collect()
+                };
+                if !ids.is_empty() {
                     if self.playlists.is_empty() {
                         self.status_msg = "no playlists — create one in the Playlists tab".into();
                     } else {
-                        let containing = self.playlists_containing(t);
+                        let containing = if ids.len() == 1 {
+                            self.playlists_containing(ids[0])
+                        } else {
+                            Vec::new()
+                        };
                         self.mode = Mode::PickPlaylist {
                             index: 0,
-                            track_id: t,
+                            track_ids: ids,
                             containing,
                         };
                     }
@@ -61,12 +96,14 @@ impl App {
                     .unwrap_or(0);
                 self.mode = Mode::SortPicker { index };
             }
-            KeyCode::Char('o') => {
-                if let Some(id) = self.selected_track().map(|t| t.id) {
-                    self.start_download(id);
-                }
-            }
+            KeyCode::Char('o') => self.download_songs_selection(),
             _ => {}
+        }
+        if self.songs_select.in_range() {
+            if let Some(idx) = self.list_state.selected() {
+                let ids: Vec<i64> = self.filtered.iter().map(|&i| self.tracks[i].id).collect();
+                self.songs_select.extend_range(idx, &ids);
+            }
         }
         Ok(())
     }

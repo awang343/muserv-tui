@@ -23,6 +23,7 @@ impl App {
             Tab::Playlists => self.render_playlists(f, outer[1]),
             Tab::Queue => self.render_queue(f, outer[1]),
             Tab::Downloads => self.render_downloads(f, outer[1]),
+            Tab::Uploads => self.render_uploads(f, outer[1]),
             Tab::Settings => self.render_settings(f, outer[1]),
         }
         self.render_footer(f, outer[2]);
@@ -46,21 +47,15 @@ impl App {
         if let Mode::SortPicker { .. } = &self.mode {
             self.render_sort_picker_overlay(f);
         }
-        if let Mode::DownloaderList { .. } = &self.mode {
-            self.render_downloader_list_overlay(f);
-        }
-        if let Mode::DownloaderInput { .. } = &self.mode {
-            self.render_downloader_input_overlay(f);
-        }
-        if matches!(self.mode, Mode::DownloaderJob) {
-            self.render_downloader_job_overlay(f);
-        }
     }
     pub(super) fn render_downloads(&mut self, f: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(format!(
-            " Downloads ({}) ",
-            self.downloads.len()
-        ));
+        let sel_count = self.downloads_select.count();
+        let title = if sel_count > 0 {
+            format!(" Downloads ({})  [{sel_count} selected] ", self.downloads.len())
+        } else {
+            format!(" Downloads ({}) ", self.downloads.len())
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
 
         let ids = self.downloads_sorted_ids();
         if ids.is_empty() {
@@ -100,7 +95,14 @@ impl App {
                     }
                     DownloadStatus::Failed => "failed".to_string(),
                 };
-                ListItem::new(Line::from(Span::raw(format!("{label}  [{status}]"))))
+                let marker = if self.downloads_select.is_selected(*id) {
+                    "✔ "
+                } else {
+                    "  "
+                };
+                ListItem::new(Line::from(Span::raw(format!(
+                    "{marker}{label}  [{status}]"
+                ))))
             })
             .collect();
 
@@ -117,120 +119,98 @@ impl App {
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, area, &mut self.downloads_state);
     }
-    pub(super) fn render_downloader_list_overlay(&self, f: &mut Frame) {
-        let Mode::DownloaderList { index } = self.mode else {
-            return;
-        };
-        let area = centered_rect(60, 60, f.area());
-        f.render_widget(ratatui::widgets::Clear, area);
+    pub(super) fn render_uploads(&mut self, f: &mut Frame, area: Rect) {
+        match self.upload_stage.clone() {
+            UploadStage::List { index } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Uploads — pick a script  (j/k, ⏎ select, r refresh) ");
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" Downloader scripts  (j/k, ⏎ select, Esc cancel) ");
+                if self.downloader_scripts.is_empty() {
+                    let text = Paragraph::new("no downloader scripts configured").block(block);
+                    f.render_widget(text, area);
+                    return;
+                }
 
-        if self.downloader_scripts.is_empty() {
-            let text = Paragraph::new("no downloader scripts configured").block(block);
-            f.render_widget(text, area);
-            return;
-        }
+                let items: Vec<ListItem> = self
+                    .downloader_scripts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        let is_cursor = i == index;
+                        let prefix = if is_cursor { "> " } else { "  " };
+                        let style = if is_cursor {
+                            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        ListItem::new(Line::from(Span::styled(
+                            format!("{prefix}{}", d.name),
+                            style,
+                        )))
+                    })
+                    .collect();
+                let list = List::new(items).block(block);
+                f.render_widget(list, area);
+            }
+            UploadStage::Input { script, buf } => {
+                let block = Block::default().borders(Borders::ALL).title(format!(
+                    " Run {script} — URL(s), comma/space/newline separated "
+                ));
+                let lines = vec![
+                    Line::from(vec![Span::raw(buf.clone()), Span::raw("_")]),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        "⏎ run   Esc back",
+                        Style::default().add_modifier(Modifier::DIM),
+                    )),
+                ];
+                f.render_widget(Paragraph::new(lines).block(block), area);
+            }
+            UploadStage::Job => {
+                let script = self.downloader_script_name.as_deref().unwrap_or("?");
+                let status = self
+                    .downloader_job
+                    .as_ref()
+                    .map(|j| j.status.as_str())
+                    .unwrap_or("starting…");
+                let block = Block::default().borders(Borders::ALL).title(format!(
+                    " Uploads — {script} ({status})  (Esc to dismiss) "
+                ));
+                let inner = block.inner(area);
+                f.render_widget(block, area);
 
-        let items: Vec<ListItem> = self
-            .downloader_scripts
-            .iter()
-            .enumerate()
-            .map(|(i, d)| {
-                let is_cursor = i == index;
-                let prefix = if is_cursor { "> " } else { "  " };
-                let style = if is_cursor {
-                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                if let Some(job) = &self.downloader_job {
+                    let extra = if job.summary.is_some() { 2 } else { 0 };
+                    let max_log = (inner.height as usize).saturating_sub(extra).max(1);
+                    let start = job.log.len().saturating_sub(max_log);
+                    for l in &job.log[start..] {
+                        lines.push(Line::raw(l.clone()));
+                    }
+                    if let Some(s) = &job.summary {
+                        lines.push(Line::raw(""));
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "import: scanned={} +{} dup={} fail={}",
+                                s.scanned, s.imported, s.duplicates, s.failed
+                            ),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    } else if job.status == "failed" {
+                        lines.push(Line::from(Span::styled(
+                            "job failed",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )));
+                    }
                 } else {
-                    Style::default()
-                };
-                ListItem::new(Line::from(Span::styled(
-                    format!("{prefix}{}", d.name),
-                    style,
-                )))
-            })
-            .collect();
-        let list = List::new(items).block(block);
-        f.render_widget(list, area);
-    }
-    pub(super) fn render_downloader_input_overlay(&self, f: &mut Frame) {
-        let Mode::DownloaderInput {
-            ref script,
-            ref buf,
-        } = self.mode
-        else {
-            return;
-        };
-        let area = centered_rect(60, 30, f.area());
-        f.render_widget(ratatui::widgets::Clear, area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!(
-                " Run {script} — URL(s), comma/space/newline separated "
-            ));
-        let lines = vec![
-            Line::from(vec![Span::raw(buf.clone()), Span::raw("_")]),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "⏎ run   Esc cancel",
-                Style::default().add_modifier(Modifier::DIM),
-            )),
-        ];
-        f.render_widget(Paragraph::new(lines).block(block), area);
-    }
-    pub(super) fn render_downloader_job_overlay(&self, f: &mut Frame) {
-        let area = centered_rect(80, 80, f.area());
-        f.render_widget(ratatui::widgets::Clear, area);
-
-        let script = self.downloader_script_name.as_deref().unwrap_or("?");
-        let status = self
-            .downloader_job
-            .as_ref()
-            .map(|j| j.status.as_str())
-            .unwrap_or("starting…");
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!(
-                " Downloader — {script} ({status})  (Esc to close) "
-            ));
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        if let Some(job) = &self.downloader_job {
-            let extra = if job.summary.is_some() { 2 } else { 0 };
-            let max_log = (inner.height as usize).saturating_sub(extra).max(1);
-            let start = job.log.len().saturating_sub(max_log);
-            for l in &job.log[start..] {
-                lines.push(Line::raw(l.clone()));
+                    lines.push(Line::raw("starting…"));
+                }
+                f.render_widget(Paragraph::new(lines), inner);
             }
-            if let Some(s) = &job.summary {
-                lines.push(Line::raw(""));
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "import: scanned={} +{} dup={} fail={}",
-                        s.scanned, s.imported, s.duplicates, s.failed
-                    ),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                )));
-            } else if job.status == "failed" {
-                lines.push(Line::from(Span::styled(
-                    "job failed",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )));
-            }
-        } else {
-            lines.push(Line::raw("starting…"));
         }
-        f.render_widget(Paragraph::new(lines), inner);
     }
     pub(super) fn render_pick_library_overlay(&self, f: &mut Frame) {
         let Mode::PickLibrary { index } = self.mode else {
@@ -331,11 +311,9 @@ impl App {
             item("← / →", "seek ±5s  (Shift: ±30s)"),
             item("S", "shuffle queue"),
             item("R", "cycle repeat (off/all/one)"),
-            item("L", "switch library"),
-            item("Ctrl+D", "run downloader script"),
             item("Ctrl+R", "refresh library from server"),
             item("?", "toggle this help"),
-            item("1-5", "switch tabs"),
+            item("1-6", "switch tabs"),
             Line::raw(""),
         ];
 
@@ -355,8 +333,10 @@ impl App {
                     lines.push(header("Songs"));
                     lines.push(item("j/k, PgUp/Dn", "move selection"));
                     lines.push(item("g / G", "top / bottom"));
+                    lines.push(item("x", "toggle mark"));
+                    lines.push(item("V", "start/end range select"));
                     lines.push(item("⏎", "play selected"));
-                    lines.push(item("a", "queue selected"));
+                    lines.push(item("a", "queue selected / marked"));
                     lines.push(item("E", "queue all (filtered)"));
                     lines.push(item("A", "add to playlist"));
                     lines.push(item("t", "show tags for selected"));
@@ -364,8 +344,8 @@ impl App {
                     lines.push(item("/", "filter"));
                     lines.push(item("T", "tag search"));
                     lines.push(item("s", "sort by…"));
-                    lines.push(item("Esc", "clear filter"));
-                    lines.push(item("o", "download selected track"));
+                    lines.push(item("Esc", "clear marks / filter"));
+                    lines.push(item("o", "download selected / marked"));
                 }
             }
             Tab::Playlists => match self.playlists_focus {
@@ -382,13 +362,15 @@ impl App {
                 PlaylistsFocus::Tracks => {
                     lines.push(header("Playlist tracks"));
                     lines.push(item("j/k", "navigate"));
+                    lines.push(item("x", "toggle mark"));
+                    lines.push(item("V", "start/end range select"));
                     lines.push(item("J / K", "reorder down / up"));
                     lines.push(item("⏎", "play from here"));
-                    lines.push(item("a", "queue track"));
-                    lines.push(item("d", "remove from playlist"));
-                    lines.push(item("o", "download selected track"));
+                    lines.push(item("a", "queue selected / marked"));
+                    lines.push(item("d", "remove selected / marked"));
+                    lines.push(item("o", "download selected / marked"));
                     lines.push(item("O", "download whole playlist"));
-                    lines.push(item("⇥ / Esc", "back to playlists"));
+                    lines.push(item("⇥ / Esc", "clear marks / back to playlists"));
                 }
             },
             Tab::Queue => {
@@ -402,9 +384,29 @@ impl App {
             Tab::Downloads => {
                 lines.push(header("Downloads"));
                 lines.push(item("j/k, g/G", "navigate"));
-                lines.push(item("⏎ / r", "retry failed"));
-                lines.push(item("⌫ / Del", "remove"));
+                lines.push(item("x", "toggle mark"));
+                lines.push(item("V", "start/end range select"));
+                lines.push(item("⏎ / r", "retry selected / marked failed"));
+                lines.push(item("⌫ / Del", "remove selected / marked"));
+                lines.push(item("Esc", "clear marks"));
             }
+            Tab::Uploads => match &self.upload_stage {
+                UploadStage::List { .. } => {
+                    lines.push(header("Uploads"));
+                    lines.push(item("j/k", "navigate scripts"));
+                    lines.push(item("⏎", "select script"));
+                    lines.push(item("r", "refresh script list"));
+                }
+                UploadStage::Input { .. } => {
+                    lines.push(header("Uploads — enter URLs"));
+                    lines.push(item("⏎", "run downloader"));
+                    lines.push(item("Esc", "back to script list"));
+                }
+                UploadStage::Job => {
+                    lines.push(header("Uploads — job log"));
+                    lines.push(item("Esc", "dismiss (keeps running in background)"));
+                }
+            },
             Tab::Settings => {
                 lines.push(header("Settings"));
                 lines.push(item("j/k", "navigate fields"));
@@ -457,7 +459,13 @@ impl App {
             .playlist_tracks
             .iter()
             .map(|pt| {
+                let marker = if self.playlist_select.is_selected(pt.position) {
+                    "✔ "
+                } else {
+                    "  "
+                };
                 let line = Line::from(vec![
+                    Span::raw(marker),
                     Span::styled(
                         format!("{:>3}. ", pt.position + 1),
                         Style::default().add_modifier(Modifier::DIM),
@@ -472,8 +480,15 @@ impl App {
                 ListItem::new(line)
             })
             .collect();
+        let sel_count = self.playlist_select.count();
         let title = if pl_name.is_empty() {
             " Tracks ".to_string()
+        } else if sel_count > 0 {
+            format!(
+                " {} ({})  [{sel_count} selected] ",
+                pl_name,
+                self.playlist_tracks.len()
+            )
         } else {
             format!(" {} ({}) ", pl_name, self.playlist_tracks.len())
         };
@@ -710,7 +725,13 @@ impl App {
                     },
                     None => String::new(),
                 };
+                let sel_marker = if self.songs_select.is_selected(t.id) {
+                    "✔ "
+                } else {
+                    "  "
+                };
                 let line = Line::from(vec![
+                    Span::raw(sel_marker),
                     Span::raw(mark),
                     Span::styled(
                         t.display_artist().to_string(),
@@ -725,7 +746,16 @@ impl App {
             })
             .collect();
 
-        let title = format!(" muserv — {} / {} ", self.filtered.len(), self.tracks.len());
+        let sel_count = self.songs_select.count();
+        let title = if sel_count > 0 {
+            format!(
+                " muserv — {} / {}  [{sel_count} selected] ",
+                self.filtered.len(),
+                self.tracks.len()
+            )
+        } else {
+            format!(" muserv — {} / {} ", self.filtered.len(), self.tracks.len())
+        };
         let block = pane_block(title, true);
         let list = List::new(items)
             .block(block)
@@ -867,7 +897,8 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let normal = matches!(self.mode, Mode::Normal);
+        let normal = matches!(self.mode, Mode::Normal)
+            && !(self.tab == Tab::Uploads && matches!(self.upload_stage, UploadStage::Input { .. }));
         let constraints: &[Constraint] = if normal {
             &[Constraint::Length(1)]
         } else {
@@ -992,20 +1023,21 @@ impl App {
                 "sort songs (j/k, ⏎ confirm, Esc cancel)",
                 Style::default().fg(Color::Cyan),
             )),
-            Mode::DownloaderList { .. } => Line::from(Span::styled(
-                "pick downloader script (j/k, ⏎ select, Esc cancel)",
-                Style::default().fg(Color::Cyan),
-            )),
-            Mode::DownloaderInput { script, buf } => Line::from(vec![
-                Span::styled(format!("run {script}: "), Style::default().fg(Color::Green)),
-                Span::raw(buf.clone()),
-                Span::raw("_"),
-            ]),
-            Mode::DownloaderJob => Line::from(Span::styled(
-                "downloader job (Esc to close — keeps running in background)",
-                Style::default().fg(Color::Cyan),
-            )),
-            Mode::Normal => Line::raw(""),
+            Mode::Normal => {
+                if self.tab == Tab::Uploads {
+                    if let UploadStage::Input { script, buf } = &self.upload_stage {
+                        return Line::from(vec![
+                            Span::styled(
+                                format!("run {script}: "),
+                                Style::default().fg(Color::Green),
+                            ),
+                            Span::raw(buf.clone()),
+                            Span::raw("_"),
+                        ]);
+                    }
+                }
+                Line::raw("")
+            }
         }
     }
 }

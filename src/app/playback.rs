@@ -75,6 +75,29 @@ impl App {
         self.mpv.set_pause(false)?;
         Ok(())
     }
+    pub(super) fn enqueue_songs_selection(&mut self) -> Result<()> {
+        if self.songs_select.count() == 0 {
+            return self.enqueue_selected();
+        }
+        let Some(lib) = self.library_id() else {
+            self.status_msg = "no library selected".into();
+            return Ok(());
+        };
+        let ids: Vec<i64> = self
+            .filtered
+            .iter()
+            .map(|&i| self.tracks[i].id)
+            .filter(|id| self.songs_select.is_selected(*id))
+            .collect();
+        let count = ids.len();
+        for id in ids {
+            let url = self.resolve_track_url(lib, id);
+            self.mpv.enqueue(&url)?;
+        }
+        self.status_msg = format!("queued {count} tracks");
+        self.songs_select.clear();
+        Ok(())
+    }
     pub(super) fn enqueue_selected(&mut self) -> Result<()> {
         let Some(track) = self.selected_track().cloned() else {
             return Ok(());

@@ -22,6 +22,7 @@ impl App {
     }
     pub(super) fn reload_downloads_for_current_library(&mut self) {
         self.downloads.clear();
+        self.downloads_select.clear();
         let Some(lib) = self.library_id else { return };
         match self.db.downloads_for_library(lib) {
             Ok(rows) => {
@@ -116,6 +117,7 @@ impl App {
         }
     }
     pub(super) fn refresh_playlist_tracks(&mut self) {
+        self.playlist_select.clear();
         let Some(id) = self.selected_playlist_id() else {
             self.playlist_tracks.clear();
             self.playlist_tracks_for = None;
@@ -237,6 +239,7 @@ impl App {
             return;
         }
         self.library_id = Some(new_id);
+        self.songs_select.clear();
         let name = self
             .libraries
             .iter()

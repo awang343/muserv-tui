@@ -118,7 +118,7 @@ impl App {
             }
             Mode::PickPlaylist {
                 mut index,
-                track_id,
+                track_ids,
                 containing,
             } => {
                 let len = self.playlists.len();
@@ -136,16 +136,25 @@ impl App {
                                 self.status_msg = "no library selected".into();
                                 return Ok(());
                             };
-                            match self.client.add_to_playlist(lib, pid, track_id) {
-                                Ok(()) => {
-                                    self.status_msg = format!("added to {pname}");
-                                    if self.playlist_tracks_for == Some(pid) {
-                                        self.refresh_playlist_tracks();
-                                    }
-                                    self.refresh_playlists();
+                            let total = track_ids.len();
+                            let mut added = 0;
+                            let mut last_err: Option<String> = None;
+                            for tid in &track_ids {
+                                match self.client.add_to_playlist(lib, pid, *tid) {
+                                    Ok(()) => added += 1,
+                                    Err(e) => last_err = Some(e.to_string()),
                                 }
-                                Err(e) => self.status_msg = format!("add failed: {e}"),
                             }
+                            self.status_msg = match last_err {
+                                Some(e) => format!("added {added}/{total} to {pname}; {e}"),
+                                None if total == 1 => format!("added to {pname}"),
+                                None => format!("added {added} tracks to {pname}"),
+                            };
+                            if self.playlist_tracks_for == Some(pid) {
+                                self.refresh_playlist_tracks();
+                            }
+                            self.refresh_playlists();
+                            self.songs_select.clear();
                         } else {
                             self.status_msg =
                                 "no playlists — create one first (Playlists tab)".into();
@@ -164,7 +173,7 @@ impl App {
                 }
                 self.mode = Mode::PickPlaylist {
                     index,
-                    track_id,
+                    track_ids,
                     containing,
                 };
                 return Ok(());
@@ -227,72 +236,24 @@ impl App {
                 self.mode = Mode::SortPicker { index };
                 return Ok(());
             }
-            Mode::DownloaderList { mut index } => {
-                let len = self.downloader_scripts.len();
-                match key.code {
-                    KeyCode::Esc => {
-                        self.mode = Mode::Normal;
-                        return Ok(());
-                    }
-                    KeyCode::Enter => {
-                        if let Some(script) =
-                            self.downloader_scripts.get(index).map(|d| d.name.clone())
-                        {
-                            self.mode = Mode::DownloaderInput {
-                                script,
-                                buf: String::new(),
-                            };
-                        }
-                        return Ok(());
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if len > 0 {
-                            index = (index + 1).min(len - 1);
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        index = index.saturating_sub(1);
-                    }
-                    _ => {}
-                }
-                self.mode = Mode::DownloaderList { index };
-                return Ok(());
-            }
-            Mode::DownloaderInput { script, mut buf } => {
-                if matches!(key.code, KeyCode::Esc) {
-                    self.mode = Mode::Normal;
-                    return Ok(());
-                }
-                if matches!(key.code, KeyCode::Enter) {
-                    self.commit_run_downloader(&script, &buf);
-                    return Ok(());
-                }
-                match key.code {
-                    KeyCode::Backspace => {
-                        buf.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        buf.push(c);
-                    }
-                    _ => {}
-                }
-                self.mode = Mode::DownloaderInput { script, buf };
-                return Ok(());
-            }
-            Mode::DownloaderJob => {
-                if matches!(key.code, KeyCode::Esc) {
-                    self.mode = Mode::Normal;
-                    self.downloader_polling = false;
-                    return Ok(());
-                }
-                return Ok(());
-            }
             Mode::Normal => {}
+        }
+
+        // While typing a URL in the Uploads tab, every key is text input —
+        // bypass tab switching and global shortcuts entirely (same as the
+        // other free-text Modes above).
+        if self.tab == Tab::Uploads {
+            if let UploadStage::Input { .. } = self.upload_stage {
+                return self.handle_uploads_key(key);
+            }
         }
 
         // Tab switching by number key (any tab).
         if let KeyCode::Char(c) = key.code {
             if let Some(t) = Tab::from_digit(c) {
+                if t == Tab::Uploads && self.tab != Tab::Uploads {
+                    self.enter_uploads_tab();
+                }
                 self.tab = t;
                 self.show_tags = false;
                 return Ok(());
@@ -368,14 +329,6 @@ impl App {
                 self.status_msg = self.repeat.status_label().into();
                 return Ok(());
             }
-            (KeyCode::Char('L'), _) => {
-                self.open_library_picker();
-                return Ok(());
-            }
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                self.open_downloader_screen();
-                return Ok(());
-            }
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                 self.manual_refresh();
                 return Ok(());
@@ -387,6 +340,7 @@ impl App {
             Tab::Songs => self.handle_songs_key(key),
             Tab::Queue => self.handle_queue_key(key),
             Tab::Downloads => self.handle_downloads_key(key),
+            Tab::Uploads => self.handle_uploads_key(key),
             Tab::Settings => self.handle_settings_key(key),
             Tab::Playlists => self.handle_playlists_key(key),
         }
