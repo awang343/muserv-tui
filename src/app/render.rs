@@ -49,15 +49,39 @@ impl App {
         }
     }
     pub(super) fn render_downloads(&mut self, f: &mut Frame, area: Rect) {
+        let ids = self.downloads_sorted_ids();
+        let downloaded_sizes: HashMap<i64, u64> = ids
+            .iter()
+            .filter_map(|id| {
+                let st = &self.downloads[id];
+                if st.status != DownloadStatus::Downloaded {
+                    return None;
+                }
+                let bytes = st
+                    .local_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len())?;
+                Some((*id, bytes))
+            })
+            .collect();
+        let total_bytes: u64 = downloaded_sizes.values().sum();
+
         let sel_count = self.downloads_select.count();
-        let title = if sel_count > 0 {
-            format!(" Downloads ({})  [{sel_count} selected] ", self.downloads.len())
-        } else {
-            format!(" Downloads ({}) ", self.downloads.len())
-        };
+        let mut title = format!(" Downloads ({})", self.downloads.len());
+        if total_bytes > 0 {
+            title = format!(
+                "{title} — {} downloaded ({})",
+                downloaded_sizes.len(),
+                fmt_bytes(total_bytes)
+            );
+        }
+        if sel_count > 0 {
+            title = format!("{title}  [{sel_count} selected]");
+        }
+        title.push(' ');
         let block = Block::default().borders(Borders::ALL).title(title);
 
-        let ids = self.downloads_sorted_ids();
         if ids.is_empty() {
             let text = Paragraph::new("no downloads").block(block);
             f.render_widget(text, area);
@@ -80,19 +104,10 @@ impl App {
                         format!("downloading {}%", (st.bytes * 100 / st.total).clamp(0, 100))
                     }
                     DownloadStatus::Downloading => "downloading".to_string(),
-                    DownloadStatus::Downloaded => {
-                        let size = st
-                            .local_path
-                            .as_ref()
-                            .and_then(|p| std::fs::metadata(p).ok())
-                            .map(|m| m.len());
-                        match size {
-                            Some(bytes) => {
-                                format!("downloaded ({:.1} MB)", bytes as f64 / 1_048_576.0)
-                            }
-                            None => "downloaded".to_string(),
-                        }
-                    }
+                    DownloadStatus::Downloaded => match downloaded_sizes.get(id) {
+                        Some(bytes) => format!("downloaded ({})", fmt_bytes(*bytes)),
+                        None => "downloaded".to_string(),
+                    },
                     DownloadStatus::Failed => "failed".to_string(),
                 };
                 let marker = if self.downloads_select.is_selected(*id) {
@@ -352,12 +367,11 @@ impl App {
                 PlaylistsFocus::List => {
                     lines.push(header("Playlists"));
                     lines.push(item("j/k", "navigate"));
-                    lines.push(item("⏎", "open playlist"));
                     lines.push(item("P", "play playlist"));
                     lines.push(item("N", "new playlist"));
                     lines.push(item("r", "rename"));
                     lines.push(item("D", "delete"));
-                    lines.push(item("⇥", "tracks pane"));
+                    lines.push(item("⇥", "open / tracks pane"));
                 }
                 PlaylistsFocus::Tracks => {
                     lines.push(header("Playlist tracks"));
@@ -1093,6 +1107,17 @@ fn fmt_unix_utc(ts: i64) -> String {
         y += 1;
     }
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes / GB)
+    } else {
+        format!("{:.1} MB", bytes / MB)
+    }
 }
 
 fn fmt_time(secs: f64) -> String {

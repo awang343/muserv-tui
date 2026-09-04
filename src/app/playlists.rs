@@ -42,10 +42,6 @@ impl App {
                     self.refresh_playlist_tracks();
                 }
             }
-            KeyCode::Enter => {
-                self.refresh_playlist_tracks();
-                self.playlists_focus = PlaylistsFocus::Tracks;
-            }
             KeyCode::Char('N') => self.mode = Mode::NewPlaylist(String::new()),
             KeyCode::Char('r') => {
                 if let (Some(id), Some(name)) =
