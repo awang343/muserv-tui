@@ -1,4 +1,4 @@
-use crate::api::{Playlist, PlaylistTrack, Track};
+use crate::api::{Library, Playlist, PlaylistTrack, Track};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
@@ -60,6 +60,11 @@ impl Db {
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS libraries (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS tracks (
                 library_id INTEGER NOT NULL,
                 id INTEGER NOT NULL,
@@ -117,6 +122,34 @@ impl Db {
             "#,
         )?;
         Ok(())
+    }
+
+    pub fn replace_libraries(&mut self, libraries: &[Library]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM libraries", [])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO libraries (id, name, path) VALUES (?1, ?2, ?3)")?;
+            for l in libraries {
+                stmt.execute(params![l.id, l.name, l.path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn libraries(&self) -> Result<Vec<Library>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, path FROM libraries")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Library {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    path: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn upsert_download(&self, row: &DownloadRow) -> Result<()> {

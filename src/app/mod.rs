@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
@@ -303,6 +304,7 @@ pub struct App {
     db: Db,
     downloads: HashMap<i64, DownloadState>,
     download_mgr: DownloadManager,
+    startup_rx: Option<mpsc::Receiver<startup::StartupSync>>,
 }
 
 mod data;
@@ -312,26 +314,53 @@ mod playback;
 mod playlists;
 mod render;
 mod settings;
+mod startup;
 mod tags;
 mod tracks;
 
 impl App {
-    pub fn new(
-        client: Client,
-        mpv: Mpv,
-        tracks: Vec<Track>,
-        tracks_fetch_failed: bool,
-        settings: Settings,
-        libraries: Vec<Library>,
-        library_id: Option<i64>,
-    ) -> Result<Self> {
+    pub fn new(client: Client, mpv: Mpv, settings: Settings) -> Result<Self> {
         let db = Db::open().context("opening local download database")?;
         let download_mgr = DownloadManager::new(client.agent());
+
+        // Populate instantly from the local cache; the real fetch happens on
+        // a background thread (see `startup::spawn_startup_sync`) so startup
+        // never blocks on the network.
+        let libraries = db.libraries().unwrap_or_default();
+        let library_id = libraries
+            .iter()
+            .find(|l| l.name == settings.selected_library)
+            .or_else(|| libraries.first())
+            .map(|l| l.id);
+        let tracks = match library_id {
+            Some(id) => db.tracks_for_library(id).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let playlists = match library_id {
+            Some(id) => db.playlists_for_library(id).unwrap_or_default(),
+            None => Vec::new(),
+        };
+
         let filtered: Vec<usize> = (0..tracks.len()).collect();
         let mut list_state = ListState::default();
         if !filtered.is_empty() {
             list_state.select(Some(0));
         }
+        let mut playlists_state = ListState::default();
+        if !playlists.is_empty() {
+            playlists_state.select(Some(0));
+        }
+
+        let startup_rx = Some(Self::spawn_startup_sync(
+            client.clone(),
+            settings.selected_library.clone(),
+        ));
+        let status_msg = if library_id.is_some() {
+            "loading from server…".into()
+        } else {
+            "connecting…".into()
+        };
+
         let mut app = Self {
             client,
             mpv,
@@ -352,8 +381,8 @@ impl App {
             settings_field: SettingsField::ServerUrl,
             current_tags: Vec::new(),
             current_tags_for: None,
-            playlists: Vec::new(),
-            playlists_state: ListState::default(),
+            playlists,
+            playlists_state,
             playlists_focus: PlaylistsFocus::List,
             playlist_tracks: Vec::new(),
             playlist_tracks_state: ListState::default(),
@@ -362,7 +391,7 @@ impl App {
             library_id,
             repeat: RepeatMode::Off,
             sort_key: SortKey::Default,
-            status_msg: String::new(),
+            status_msg,
             show_help: false,
             show_tags: false,
             show_details: false,
@@ -376,10 +405,17 @@ impl App {
             db,
             downloads: HashMap::new(),
             download_mgr,
+            startup_rx,
         };
         app.sort_filtered();
-        app.sync_initial_tracks_cache(tracks_fetch_failed);
-        app.refresh_playlists();
+        if let Some(id) = app.selected_playlist_id() {
+            if let Ok(cached) = app.db.playlist_tracks_for(app.library_id.unwrap(), id) {
+                app.playlist_tracks = cached;
+                app.playlist_tracks_for = Some(id);
+                app.playlist_tracks_state
+                    .select((!app.playlist_tracks.is_empty()).then_some(0));
+            }
+        }
         app.reload_downloads_for_current_library();
         Ok(app)
     }
@@ -402,6 +438,7 @@ impl App {
             }
             self.poll_downloader_if_due();
             self.drain_download_events();
+            self.drain_startup_sync();
         }
         Ok(())
     }

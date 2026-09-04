@@ -2,24 +2,6 @@ use super::tags::track_id_from_url;
 use super::*;
 
 impl App {
-    pub(super) fn sync_initial_tracks_cache(&mut self, fetch_failed: bool) {
-        let Some(lib) = self.library_id else { return };
-        if fetch_failed {
-            match self.db.tracks_for_library(lib) {
-                Ok(cached) if !cached.is_empty() => {
-                    self.tracks = cached;
-                    self.apply_filter("");
-                    self.status_msg = "offline — showing cached library".into();
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    self.status_msg = format!("offline — cache read failed: {e}");
-                }
-            }
-        } else if let Err(e) = self.db.replace_tracks(lib, &self.tracks) {
-            self.status_msg = format!("failed to cache tracks: {e}");
-        }
-    }
     pub(super) fn reload_downloads_for_current_library(&mut self) {
         self.downloads.clear();
         self.downloads_select.clear();
@@ -40,6 +22,9 @@ impl App {
         match self.client.list_libraries() {
             Ok(libs) => {
                 let prev_id = self.library_id;
+                if let Err(e) = self.db.replace_libraries(&libs) {
+                    self.status_msg = format!("failed to cache libraries: {e}");
+                }
                 self.libraries = libs;
                 // Keep current selection if still present; otherwise pick first.
                 let new = prev_id

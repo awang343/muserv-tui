@@ -56,52 +56,15 @@ fn main() -> Result<()> {
     };
     let client = api::Client::new(s.server_url.clone(), token_opt.clone());
 
-    let libraries = client.list_libraries().unwrap_or_else(|e| {
-        eprintln!(
-            "warning: could not list libraries from {}: {e}",
-            s.server_url
-        );
-        eprintln!("starting with empty library — use the Settings tab to fix.");
-        Vec::new()
-    });
-
-    // Resolve selected library: prefer the saved name, else first.
-    let selected = libraries
-        .iter()
-        .find(|l| l.name == s.selected_library)
-        .or_else(|| libraries.first())
-        .cloned();
-    if let Some(ref lib) = selected {
-        s.selected_library = lib.name.clone();
-    }
-
-    let (tracks, tracks_fetch_failed) = match &selected {
-        Some(lib) => match client.list_tracks(lib.id) {
-            Ok(t) => (t, false),
-            Err(e) => {
-                eprintln!("warning: list_tracks failed for {}: {e}", lib.name);
-                (Vec::new(), true)
-            }
-        },
-        None => (Vec::new(), false),
-    };
-
     let mut headers = Vec::new();
     if let Some(t) = &token_opt {
         headers.push(format!("Authorization: Bearer {t}"));
     }
     let mpv = mpv::Mpv::spawn(&headers).context("spawning mpv")?;
 
-    let mut app = app::App::new(
-        client,
-        mpv,
-        tracks,
-        tracks_fetch_failed,
-        s,
-        libraries,
-        selected.map(|l| l.id),
-    )
-    .context("initializing app")?;
+    // App::new shows cached libraries/tracks/playlists instantly and fetches
+    // fresh data from the server on a background thread.
+    let mut app = app::App::new(client, mpv, s).context("initializing app")?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
