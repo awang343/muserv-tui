@@ -34,8 +34,8 @@ pub struct Mpv {
 
 impl Mpv {
     pub fn spawn(http_headers: &[String]) -> Result<Self> {
-        let socket_path = std::env::temp_dir()
-            .join(format!("mutui-mpv-{}.sock", std::process::id()));
+        let socket_path =
+            std::env::temp_dir().join(format!("mutui-mpv-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket_path);
 
         let log_stderr = open_mpv_log().unwrap_or_else(|_| Stdio::null());
@@ -85,19 +85,21 @@ impl Mpv {
         thread::spawn(move || {
             for line in reader.lines() {
                 let Ok(line) = line else { break };
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
                 if v.get("event").and_then(Value::as_str) != Some("property-change") {
                     continue;
                 }
                 let name = v.get("name").and_then(Value::as_str);
                 let data = v.get("data");
-                let Ok(mut s) = state_for_reader.lock() else { break };
+                let Ok(mut s) = state_for_reader.lock() else {
+                    break;
+                };
                 match name {
                     Some("time-pos") => s.time_pos = data.and_then(Value::as_f64),
                     Some("duration") => s.duration = data.and_then(Value::as_f64),
-                    Some("pause") => {
-                        s.paused = data.and_then(Value::as_bool).unwrap_or(false)
-                    }
+                    Some("pause") => s.paused = data.and_then(Value::as_bool).unwrap_or(false),
                     Some("idle-active") => {
                         s.idle_active = data.and_then(Value::as_bool).unwrap_or(false)
                     }

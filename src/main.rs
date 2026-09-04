@@ -10,8 +10,11 @@ use std::io;
 
 mod api;
 mod app;
+mod db;
+mod downloads;
 mod mpv;
 mod settings;
+mod storage;
 
 #[derive(Parser, Debug)]
 #[command(name = "mutui", about = "TUI client for Muserv")]
@@ -54,7 +57,10 @@ fn main() -> Result<()> {
     let client = api::Client::new(s.server_url.clone(), token_opt.clone());
 
     let libraries = client.list_libraries().unwrap_or_else(|e| {
-        eprintln!("warning: could not list libraries from {}: {e}", s.server_url);
+        eprintln!(
+            "warning: could not list libraries from {}: {e}",
+            s.server_url
+        );
         eprintln!("starting with empty library — use the Settings tab to fix.");
         Vec::new()
     });
@@ -69,15 +75,15 @@ fn main() -> Result<()> {
         s.selected_library = lib.name.clone();
     }
 
-    let tracks = match &selected {
+    let (tracks, tracks_fetch_failed) = match &selected {
         Some(lib) => match client.list_tracks(lib.id) {
-            Ok(t) => t,
+            Ok(t) => (t, false),
             Err(e) => {
                 eprintln!("warning: list_tracks failed for {}: {e}", lib.name);
-                Vec::new()
+                (Vec::new(), true)
             }
         },
-        None => Vec::new(),
+        None => (Vec::new(), false),
     };
 
     let mut headers = Vec::new();
@@ -86,7 +92,16 @@ fn main() -> Result<()> {
     }
     let mpv = mpv::Mpv::spawn(&headers).context("spawning mpv")?;
 
-    let mut app = app::App::new(client, mpv, tracks, s, libraries, selected.map(|l| l.id));
+    let mut app = app::App::new(
+        client,
+        mpv,
+        tracks,
+        tracks_fetch_failed,
+        s,
+        libraries,
+        selected.map(|l| l.id),
+    )
+    .context("initializing app")?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

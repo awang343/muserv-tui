@@ -85,6 +85,14 @@ impl Client {
         self.token.as_ref().map(|t| format!("Bearer {t}"))
     }
 
+    pub fn agent(&self) -> ureq::Agent {
+        self.agent.clone()
+    }
+
+    pub fn auth_header_value(&self) -> Option<String> {
+        self.auth_header()
+    }
+
     fn get(&self, path: &str) -> RequestBuilder<WithoutBody> {
         let mut r = self.agent.get(self.url(path));
         if let Some(a) = self.auth_header() {
@@ -262,11 +270,7 @@ impl Client {
         decode_json(resp, "decode playlist tracks")
     }
 
-    pub fn playlists_containing_track(
-        &self,
-        library_id: i64,
-        track_id: i64,
-    ) -> Result<Vec<i64>> {
+    pub fn playlists_containing_track(&self, library_id: i64, track_id: i64) -> Result<Vec<i64>> {
         let resp = self
             .get(&format!(
                 "/api/libraries/{library_id}/tracks/{track_id}/playlists"
