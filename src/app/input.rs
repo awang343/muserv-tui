@@ -54,7 +54,8 @@ impl App {
                 if matches!(key.code, KeyCode::Enter) {
                     match field {
                         SettingsField::ServerUrl => self.settings.server_url = buf,
-                        SettingsField::AuthToken => self.settings.auth_token = buf,
+                        SettingsField::Username => self.settings.username = buf,
+                        SettingsField::Token => self.settings.token = buf,
                         SettingsField::Library => {} // picked via overlay, not text input
                     }
                     self.mode = Mode::Normal;

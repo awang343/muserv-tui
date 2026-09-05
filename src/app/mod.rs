@@ -113,20 +113,23 @@ enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsField {
     ServerUrl,
-    AuthToken,
+    Username,
+    Token,
     Library,
 }
 
 impl SettingsField {
-    const ALL: [SettingsField; 3] = [
+    const ALL: [SettingsField; 4] = [
         SettingsField::ServerUrl,
-        SettingsField::AuthToken,
+        SettingsField::Username,
+        SettingsField::Token,
         SettingsField::Library,
     ];
     fn label(&self) -> &'static str {
         match self {
             SettingsField::ServerUrl => "Server URL",
-            SettingsField::AuthToken => "Auth Token",
+            SettingsField::Username => "Username",
+            SettingsField::Token => "Token",
             SettingsField::Library => "Library",
         }
     }

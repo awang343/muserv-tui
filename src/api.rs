@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use ureq::http::Response;
 use ureq::typestate::{WithBody, WithoutBody};
@@ -59,12 +60,12 @@ impl Track {
 #[derive(Clone)]
 pub struct Client {
     base: String,
-    token: Option<String>,
+    credentials: Option<(String, String)>,
     agent: ureq::Agent,
 }
 
 impl Client {
-    pub fn new(base: String, token: Option<String>) -> Self {
+    pub fn new(base: String, credentials: Option<(String, String)>) -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(10)))
             .http_status_as_error(false)
@@ -72,7 +73,7 @@ impl Client {
         let agent: ureq::Agent = config.into();
         Self {
             base: base.trim_end_matches('/').to_string(),
-            token,
+            credentials,
             agent,
         }
     }
@@ -82,7 +83,11 @@ impl Client {
     }
 
     fn auth_header(&self) -> Option<String> {
-        self.token.as_ref().map(|t| format!("Bearer {t}"))
+        self.credentials.as_ref().map(|(username, token)| {
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{token}"));
+            format!("Basic {encoded}")
+        })
     }
 
     pub fn agent(&self) -> ureq::Agent {

@@ -23,7 +23,11 @@ struct Cli {
     #[arg(short, long, env = "MUSIC_LIB_URL")]
     server: Option<String>,
 
-    /// Bearer token (overrides settings file).
+    /// Username (overrides settings file).
+    #[arg(short, long, env = "MUSIC_LIB_USERNAME")]
+    username: Option<String>,
+
+    /// Token (overrides settings file).
     #[arg(short, long, env = "MUSIC_LIB_TOKEN")]
     token: Option<String>,
 
@@ -39,8 +43,11 @@ fn main() -> Result<()> {
     if let Some(url) = cli.server {
         s.server_url = url;
     }
+    if let Some(username) = cli.username {
+        s.username = username;
+    }
     if let Some(tok) = cli.token {
-        s.auth_token = tok;
+        s.token = tok;
     }
     if let Some(lib) = cli.library {
         s.selected_library = lib;
@@ -49,16 +56,16 @@ fn main() -> Result<()> {
         s.server_url = "http://127.0.0.1:7700".into();
     }
 
-    let token_opt = if s.auth_token.is_empty() {
+    let credentials = if s.username.is_empty() || s.token.is_empty() {
         None
     } else {
-        Some(s.auth_token.clone())
+        Some((s.username.clone(), s.token.clone()))
     };
-    let client = api::Client::new(s.server_url.clone(), token_opt.clone());
+    let client = api::Client::new(s.server_url.clone(), credentials);
 
     let mut headers = Vec::new();
-    if let Some(t) = &token_opt {
-        headers.push(format!("Authorization: Bearer {t}"));
+    if let Some(auth) = client.auth_header_value() {
+        headers.push(format!("Authorization: {auth}"));
     }
     let mpv = mpv::Mpv::spawn(&headers).context("spawning mpv")?;
 

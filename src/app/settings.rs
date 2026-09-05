@@ -24,9 +24,13 @@ impl App {
                     self.mode =
                         Mode::EditSetting(self.settings_field, self.settings.server_url.clone());
                 }
-                SettingsField::AuthToken => {
+                SettingsField::Username => {
                     self.mode =
-                        Mode::EditSetting(self.settings_field, self.settings.auth_token.clone());
+                        Mode::EditSetting(self.settings_field, self.settings.username.clone());
+                }
+                SettingsField::Token => {
+                    self.mode =
+                        Mode::EditSetting(self.settings_field, self.settings.token.clone());
                 }
                 SettingsField::Library => self.open_library_picker(),
             },
@@ -46,16 +50,16 @@ impl App {
         }
         self.saved_settings = self.settings.clone();
 
-        let token_opt = if self.settings.auth_token.is_empty() {
+        let credentials = if self.settings.username.is_empty() || self.settings.token.is_empty() {
             None
         } else {
-            Some(self.settings.auth_token.clone())
+            Some((self.settings.username.clone(), self.settings.token.clone()))
         };
-        self.client = api::Client::new(self.settings.server_url.clone(), token_opt.clone());
+        self.client = api::Client::new(self.settings.server_url.clone(), credentials);
 
         let mut headers = Vec::new();
-        if let Some(t) = &token_opt {
-            headers.push(format!("Authorization: Bearer {t}"));
+        if let Some(auth) = self.client.auth_header_value() {
+            headers.push(format!("Authorization: {auth}"));
         }
         let _ = self.mpv.set_http_headers(&headers);
 

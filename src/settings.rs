@@ -5,7 +5,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     pub server_url: String,
-    pub auth_token: String,
+    pub username: String,
+    pub token: String,
     /// Last-selected library, persisted by name (server IDs are not stable
     /// across reinstalls). Empty until the user picks one.
     #[serde(default)]

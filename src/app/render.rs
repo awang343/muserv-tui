@@ -602,7 +602,8 @@ impl App {
         for field in SettingsField::ALL {
             let val: String = match field {
                 SettingsField::ServerUrl => self.settings.server_url.clone(),
-                SettingsField::AuthToken => self.settings.auth_token.clone(),
+                SettingsField::Username => self.settings.username.clone(),
+                SettingsField::Token => self.settings.token.clone(),
                 SettingsField::Library => self
                     .current_library_name()
                     .unwrap_or_else(|| "(none)".into()),
@@ -643,7 +644,8 @@ impl App {
         }
 
         let dirty = self.settings.server_url != self.saved_settings.server_url
-            || self.settings.auth_token != self.saved_settings.auth_token;
+            || self.settings.username != self.saved_settings.username
+            || self.settings.token != self.saved_settings.token;
         if dirty {
             lines.push(Line::from(Span::styled(
                 "  unsaved changes — 's' save, 'r'/Esc revert",
